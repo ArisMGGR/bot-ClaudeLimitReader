@@ -1,0 +1,39 @@
+# ClaudeLimitReader configuration.
+#
+# Copy to ~/.claudelimitreader/config.toml (or point CLR_CONFIG at it) and fill
+# in your bot tokens and user IDs. Tokens may also come from the environment as
+# CLR_DISCORD_TOKEN / CLR_TELEGRAM_TOKEN, which takes precedence over the values
+# here — preferable if you'd rather not keep secrets in a file.
+
+[discord]
+enabled = false
+# Bot token from https://discord.com/developers/applications -> Bot -> Reset Token
+token = ""
+# Your Discord user ID. Enable Developer Mode in Discord (Settings -> Advanced),
+# then right-click your name -> Copy User ID. Anyone not listed is refused.
+allowed_user_ids = []
+
+# Optional: register /usage in this one server instead of globally. Guild-scoped
+# commands appear the moment the bot starts, whereas global registration can
+# take up to an hour to propagate. Right-click the server icon -> Copy Server ID.
+# Leave commented out for a global (or user-install) registration.
+# guild_id = 000000000000000000
+
+[telegram]
+enabled = false
+# Bot token from @BotFather in Telegram (/newbot, or /token for an existing one)
+token = ""
+# Your numeric Telegram user ID — message @userinfobot to get it.
+# Unlisted users are ignored silently, so the bot stays invisible to strangers.
+allowed_user_ids = []
+
+[pace]
+# Flag overspending once the share of quota used exceeds the share of the window
+# elapsed by more than this many percentage points. 5.0 tolerates normal bursts;
+# lower it if you want earlier warnings.
+tolerance_points = 5.0
+
+# The verdict escalates from "overspending" to "overspending badly" at this
+# multiple of the even pace. 1.5 means burning quota 50% faster than the window
+# is passing.
+critical_ratio = 1.5

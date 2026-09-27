@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+config.toml
+config.toml.bak
+*.tmp
+tokens.json
+service.env
+claude-limit-reader-bot.cmd
+*.log
+logs/
+service.pid
+tests/FINDINGS.md
+tests/VERIFY.md
+tests/LOG.md

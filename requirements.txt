@@ -1,0 +1,3 @@
+# Install only what you need; both are optional depending on enabled platforms.
+discord.py>=2.4,<3
+python-telegram-bot>=21,<23

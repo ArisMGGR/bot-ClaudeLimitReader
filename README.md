@@ -1,5 +1,21 @@
 # ClaudeLimitReader
 
+**Install the service** (run `python run.py setup` first if the bot isn't configured yet):
+
+```bash
+python run.py service install
+```
+
+**Uninstall the service** (stops the bot and removes the service):
+
+```bash
+sudo python3 run.py service uninstall --system
+```
+
+On Windows, run `python run.py service uninstall` instead, from an elevated
+terminal if the service was installed from one. See
+[Running as a service](#running-as-a-service) for details.
+
 A Discord and Telegram bot that reports how much of your Claude subscription
 quota is left, and warns when you are burning it faster than the week can
 absorb.

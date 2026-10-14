@@ -15,7 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clr import logs  # noqa: E402
-from clr.logs import build_handler, heartbeat  # noqa: E402
+from clr.logs import Outage, build_handler, describe_error, heartbeat  # noqa: E402
 
 
 class DailyLogTest(unittest.TestCase):
@@ -119,6 +119,56 @@ class SudoOwnershipTest(unittest.TestCase):
         self.assertEqual(self.build(directory / "again", 0, env), [])
 
 
+class OutageTest(unittest.TestCase):
+    """Connection failures fold into one line each and a closing summary."""
+
+    def setUp(self):
+        self.log = logging.getLogger(f"clr.test.outage.{id(self)}")
+        self.outage = Outage(self.log, "Gateway", escalate_after=600)
+
+    def fail(self, now, exc=None):
+        self.outage.failed(exc or OSError("Network is unreachable"), retry_in=3.07, now=now)
+
+    def test_each_failure_is_one_warning_and_recovery_one_info(self):
+        with self.assertLogs(self.log, level="DEBUG") as cm:
+            self.fail(1000)
+            self.fail(1030)
+            self.outage.restored(now=1258)
+            self.outage.restored(now=1300)  # nothing left to report
+        levels = [r.levelname for r in cm.records]
+        self.assertEqual(levels, ["WARNING", "WARNING", "INFO"])
+        self.assertTrue(all(r.exc_info is None for r in cm.records))
+        self.assertIn("attempt 2, down 30s", cm.records[1].getMessage())
+        self.assertIn("retrying in 3s", cm.records[1].getMessage())
+        self.assertIn("back after 4m 18s (2 failed attempt(s)", cm.records[2].getMessage())
+
+    def test_a_long_outage_is_escalated_to_error_once(self):
+        with self.assertLogs(self.log, level="DEBUG") as cm:
+            for t in (0, 300, 600, 900):
+                self.fail(t)
+        self.assertEqual(
+            [r.levelname for r in cm.records], ["WARNING", "WARNING", "ERROR", "WARNING"]
+        )
+        self.assertIn("still down after 10m 00s", cm.records[2].getMessage())
+
+    def test_a_quiet_gap_starts_a_new_outage(self):
+        outage = Outage(self.log, "Polling", quiet_gap=300)
+        with self.assertLogs(self.log, level="DEBUG") as cm:
+            outage.failed(OSError("down"), now=0)
+            outage.failed(OSError("down"), now=10_000)
+        self.assertIn("attempt 1, down 0s", cm.records[1].getMessage())
+
+    def test_describe_error_borrows_the_cause_for_an_empty_message(self):
+        try:
+            try:
+                raise OSError("Network is unreachable")
+            except OSError as e:
+                raise asyncio.TimeoutError() from e
+        except asyncio.TimeoutError as e:
+            text = describe_error(e)
+        self.assertEqual(text, "TimeoutError: OSError: Network is unreachable")
+
+
 class HeartbeatTest(unittest.TestCase):
     def setUp(self):
         self.records = []
@@ -153,6 +203,15 @@ class HeartbeatTest(unittest.TestCase):
             await asyncio.sleep(0.02)
             logging.getLogger("clr.test").error("boom")
             await asyncio.sleep(0.13)  # past the first window, not the second
+
+        self._run(body)
+        self.assertEqual(self._beats(), [])
+
+    def test_skips_windows_with_a_warning(self):
+        async def body():
+            await asyncio.sleep(0.02)
+            logging.getLogger("clr.test").warning("gateway unreachable")
+            await asyncio.sleep(0.13)
 
         self._run(body)
         self.assertEqual(self._beats(), [])

@@ -18,6 +18,7 @@ from ..auth import (
     start_login,
 )
 from ..config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config
+from ..logs import Outage
 from ..pace import humanize
 from ..render import (
     _severity_icon,
@@ -56,12 +57,35 @@ def build_embed(cfg: Config) -> discord.Embed:
     return embed
 
 
+class _ReconnectFilter(logging.Filter):
+    """Swaps discord.py's per-retry traceback for the outage's one-liner.
+
+    ``Client.connect`` logs every failed gateway reconnect with
+    ``log.exception("Attempting a reconnect in %.2fs")``: some 60 lines of
+    aiohttp/asyncio frames per attempt, a dozen attempts for a short network
+    drop. The cause and the retry delay are all that line carries.
+    """
+
+    def __init__(self, outage: Outage) -> None:
+        super().__init__()
+        self.outage = outage
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if exc is None or not str(record.msg).startswith("Attempting a reconnect"):
+            return True
+        retry = record.args[0] if isinstance(record.args, tuple) and record.args else None
+        self.outage.failed(exc, retry_in=retry, now=record.created)
+        return False
+
+
 class UsageClient(discord.Client):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, outage: Outage | None = None):
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
         self.started_at = dt.datetime.now(dt.timezone.utc)  # for /status
+        self.outage = outage or Outage(log, "Discord gateway")
 
     async def setup_hook(self) -> None:
         self.tree.add_command(_make_usage_command(self.cfg))
@@ -80,7 +104,12 @@ class UsageClient(discord.Client):
             log.info("slash commands synced globally (may take up to an hour)")
 
     async def on_ready(self) -> None:
+        self.outage.restored()
         log.info("connected as %s", self.user)
+
+    async def on_resumed(self) -> None:
+        # A successful RESUME after a drop fires this instead of on_ready.
+        self.outage.restored()
 
 
 def _make_usage_command(cfg: Config) -> app_commands.Command:
@@ -348,9 +377,11 @@ def _make_authenticate_command(cfg: Config) -> app_commands.Command:
 
 
 async def run(cfg: Config) -> None:
+    outage = Outage(log, "Discord gateway")
+
     async def login() -> UsageClient:
         # A fresh client per attempt; login() also runs setup_hook's sync.
-        client = UsageClient(cfg)
+        client = UsageClient(cfg, outage)
         try:
             await client.login(cfg.discord.token)
         except BaseException:
@@ -363,7 +394,11 @@ async def run(cfg: Config) -> None:
     client = await retry_startup(
         "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
     )
+    reconnects = _ReconnectFilter(outage)
+    client_log = logging.getLogger("discord.client")
+    client_log.addFilter(reconnects)
     try:
         await client.connect(reconnect=True)
     finally:
+        client_log.removeFilter(reconnects)
         await client.close()

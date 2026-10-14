@@ -1,9 +1,9 @@
 # ClaudeLimitReader
 
-**Install the service** (run `python run.py setup` first if the bot isn't configured yet):
+**Set up and install** (guided: venv, login, bot tokens, config, then offers to install the service):
 
 ```bash
-python run.py service install
+python3 run.py setup
 ```
 
 **Uninstall the service** (stops the bot and removes the service):
@@ -258,9 +258,17 @@ file by itself at local midnight. Console output is unchanged; `-v` raises both
 to debug level. If the directory cannot be written, the command warns once and
 carries on without file logging.
 
-While `python run.py run` is up, it also writes an `All good — no errors in the
-last 30 minutes.` line every 30 minutes that passed without an error, so a
-quiet log still shows the bot was alive. A window with an error gets no such line.
+While `python run.py run` is up, it also writes an `All good — no warnings or
+errors in the last 30 minutes.` line every 30 minutes that passed without a
+problem, so a quiet log still shows the bot was alive. A window with a warning
+or an error gets no such line.
+
+A dropped network connection (no DNS, network unreachable) is logged as one
+`WARNING` line per reconnect attempt with its cause, not as a traceback. Once
+the Discord gateway is back, one `INFO` line gives the outage length and the
+number of failed attempts. An outage still going after 15 minutes is logged
+once as an `ERROR`. Telegram polling failures get the same one-line treatment.
+To find outages, run `grep -E "WARNING|ERROR" logs/*.log`.
 
 ## Commands
 

@@ -4,7 +4,10 @@ These drive the command callbacks against stub interactions; nothing here
 connects to Discord.
 """
 
+import asyncio
 import datetime as dt
+import logging
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -344,7 +347,7 @@ class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
 
     def fake_client(self, outcomes, log):
         class FakeClient:
-            def __init__(self, cfg):
+            def __init__(self, cfg, outage=None):
                 log.append("new")
 
             async def login(self, token):
@@ -380,6 +383,64 @@ class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(discord.LoginFailure):
                 await discord_bot.run(cfg())
         self.assertEqual(log, ["new", "close"])
+
+
+@unittest.skipIf(discord_bot is None, "discord.py is not installed")
+class ReconnectLogTest(unittest.TestCase):
+    """A gateway reconnect logs one line, not discord.py's traceback."""
+
+    def setUp(self):
+        from clr.logs import Outage
+
+        self.outage = Outage(discord_bot.log, "Discord gateway")
+        self.filter = discord_bot._ReconnectFilter(self.outage)
+        self.client_log = logging.getLogger("discord.client")
+        self.client_log.addFilter(self.filter)
+        self.addCleanup(self.client_log.removeFilter, self.filter)
+        self.old_level = self.client_log.level
+        self.client_log.setLevel(logging.DEBUG)
+        self.addCleanup(self.client_log.setLevel, self.old_level)
+
+    def reconnect(self):
+        try:
+            try:
+                raise socket.gaierror(-3, "Temporary failure in name resolution")
+            except OSError as e:
+                raise OSError(
+                    "Cannot connect to host gateway.discord.gg:443 ssl:default "
+                    "[Temporary failure in name resolution]"
+                ) from e
+        except OSError:
+            self.client_log.exception("Attempting a reconnect in %.2fs", 1.21)
+
+    def test_reconnect_becomes_a_one_line_warning(self):
+        with self.assertLogs("clr.discord", level="DEBUG") as clr_logs, \
+             self.assertNoLogs("discord.client", level="DEBUG"):
+            self.reconnect()
+        self.assertEqual(len(clr_logs.records), 1)
+        record = clr_logs.records[0]
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIsNone(record.exc_info)
+        self.assertIn("name resolution", record.getMessage())
+        self.assertIn("retrying in 1s", record.getMessage())
+
+    def test_other_discord_client_records_pass_through(self):
+        with self.assertLogs("discord.client", level="ERROR"):
+            try:
+                raise ValueError("bug")
+            except ValueError:
+                self.client_log.exception("Ignoring exception in on_message")
+
+    def test_ready_reports_the_outage_once(self):
+        client = discord_bot.UsageClient(cfg(), self.outage)
+        with self.assertLogs("clr.discord", level="INFO") as clr_logs:
+            self.reconnect()
+            self.reconnect()
+            asyncio.run(client.on_resumed())
+            asyncio.run(client.on_resumed())
+        back = [r.getMessage() for r in clr_logs.records if "back after" in r.getMessage()]
+        self.assertEqual(len(back), 1, back)
+        self.assertIn("2 failed attempt(s)", back[0])
 
 
 if __name__ == "__main__":

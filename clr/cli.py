@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .auth import AuthError, load_tokens
 from .config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config, ConfigError, load_config
-from .logs import build_handler as build_log_handler, heartbeat
+from .logs import Outage, build_handler as build_log_handler, heartbeat
 from .render import render_plain
 from .service import ServiceError, record_running_instance
 from .setup import cmd_setup, interactive_login
@@ -151,8 +151,11 @@ async def _run_telegram(cfg: Config) -> None:
 
     app = await retry_startup("telegram", initialize, (NetworkError,))
     await app.start()
+    # Polling failures get one line each instead of the library's traceback.
+    # Polling retries at most 30s apart, so five quiet minutes end an outage.
+    outage = Outage(logging.getLogger("clr.telegram"), "Telegram polling", quiet_gap=5 * 60)
     # -1: keep retrying the polling bootstrap too, rather than exiting on it.
-    await app.updater.start_polling(bootstrap_retries=-1)
+    await app.updater.start_polling(bootstrap_retries=-1, error_callback=outage.failed)
     try:
         await asyncio.Event().wait()  # run until cancelled
     finally:

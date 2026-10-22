@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from clr import auth, usage  # noqa: E402
+from clr import auth, config, usage  # noqa: E402
 from clr.auth import AuthError, Tokens  # noqa: E402
 from clr.usage import UsageError  # noqa: E402
 
@@ -51,11 +51,25 @@ class LoadTokensTest(StoreTestCase):
                     auth.load_tokens()
 
     def test_unreadable_file_is_an_auth_error(self):
-        """A tokens.json that cannot be opened is not a traceback (F-051)."""
+        """A tokens.json that cannot be opened is not a traceback."""
         self.path.mkdir()  # opening a directory fails on every platform
         with self.assertRaises(AuthError) as ctx:
             auth.load_tokens()
         self.assertIn("cannot read", str(ctx.exception))
+
+    def test_unwritable_store_is_an_auth_error(self):
+        """A token file that cannot be written is an Error line, not a traceback."""
+        blocker = self.path.parent / "not-a-dir"
+        blocker.write_text("a file where the app dir should be", encoding="utf-8")
+        app = blocker / "clr"
+        # The real ensure_app_dir, which fails first when the app dir cannot be made.
+        with mock.patch.object(auth, "ensure_app_dir", config.ensure_app_dir), \
+             mock.patch.object(config, "APP_DIR", app), \
+             mock.patch.object(auth, "TOKEN_PATH", app / "tokens.json"):
+            with self.assertRaises(AuthError) as ctx:
+                auth.save_tokens(Tokens("a", "r", time.time() + 3600))
+        self.assertIn("cannot write", str(ctx.exception))
+        self.assertIn("login", str(ctx.exception))
 
     def test_save_leaves_no_temp_files(self):
         auth.save_tokens(Tokens("a", "r", time.time() + 3600))
@@ -69,7 +83,7 @@ class LoadTokensTest(StoreTestCase):
 
 
 class RefreshSerializationTest(StoreTestCase):
-    """Two threads with an expired token must spend the refresh token once (F-013)."""
+    """Two threads with an expired token must spend the refresh token once."""
 
     def test_concurrent_refreshes_hit_the_server_once(self):
         self.store()
@@ -111,7 +125,7 @@ class RefreshSerializationTest(StoreTestCase):
 
 
 class NetworkErrorTest(unittest.TestCase):
-    """Network failures surface as the domain errors callers handle (F-008)."""
+    """Network failures surface as the domain errors callers handle."""
 
     def test_token_endpoint_unreachable(self):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
@@ -140,7 +154,7 @@ class NetworkErrorTest(unittest.TestCase):
                 usage._get("https://example.invalid/usage", "token")
 
     def test_a_truncated_body_is_a_domain_error(self):
-        """IncompleteRead is an HTTPException, not an OSError (F-060)."""
+        """IncompleteRead is an HTTPException, not an OSError."""
         response = mock.MagicMock()
         response.__enter__.return_value = response
         response.status = 200
@@ -155,7 +169,7 @@ class NetworkErrorTest(unittest.TestCase):
                         call()
 
     def test_an_unreadable_error_body_keeps_its_status(self):
-        """The body of a 401 or 5xx can be cut off too; its status must survive (F-060)."""
+        """The body of a 401 or 5xx can be cut off too; its status must survive."""
 
         def unreadable(exc):
             class Body(io.BytesIO):

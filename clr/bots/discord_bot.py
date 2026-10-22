@@ -17,7 +17,7 @@ from ..auth import (
     save_tokens,
     start_login,
 )
-from ..config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config
+from ..config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config, ConfigError
 from ..logs import Outage
 from ..pace import humanize
 from ..render import (
@@ -97,7 +97,21 @@ class UsageClient(discord.Client):
             # Guild-scoped commands appear at once; global ones can take ~1h.
             guild = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.DiscordServerError:
+                raise  # transient; retry_startup tries again
+            except discord.HTTPException as e:
+                # A server the bot is not in (403) or no such server (404) is a
+                # config mistake: say so and stay up, rather than end the bot
+                # and the Telegram one beside it.
+                log.error(
+                    "could not register slash commands in guild %s (%s); check "
+                    "discord.guild_id and that the bot was invited to that server "
+                    "with the applications.commands scope, then restart",
+                    guild_id, e,
+                )
+                return
             log.info("slash commands synced to guild %s", guild_id)
         else:
             await self.tree.sync()
@@ -241,21 +255,22 @@ def _make_status_command(cfg: Config) -> app_commands.Command:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            embed = build_status_embed(cfg, interaction.client)
+            # Off the event loop: load_tokens waits on the token lock, which a
+            # refresh holds for as long as the token endpoint takes to answer.
+            embed = await asyncio.to_thread(build_status_embed, cfg, interaction.client)
         except AuthError as e:
-            await interaction.response.send_message(
-                f"⚠️ Auth problem\n```{e}```", ephemeral=True
-            )
+            await interaction.followup.send(f"⚠️ Auth problem\n```{e}```", ephemeral=True)
             return
         except Exception:
             log.exception("unexpected failure building status embed")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ Unexpected error — check the bot logs.", ephemeral=True
             )
             return
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     return status
 
@@ -391,9 +406,16 @@ async def run(cfg: Config) -> None:
 
     # OSError covers aiohttp's connection errors. connect() then handles its
     # own reconnects; a bad token (LoginFailure) is not retried.
-    client = await retry_startup(
-        "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
-    )
+    try:
+        client = await retry_startup(
+            "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
+        )
+    except discord.LoginFailure:
+        # An "Error:" line like Telegram's rejected token, not a traceback.
+        raise ConfigError(
+            "Discord rejected the bot token; check discord.token (or "
+            "CLR_DISCORD_TOKEN), and reset it on the Developer Portal's Bot tab if it was revoked"
+        ) from None
     reconnects = _ReconnectFilter(outage)
     client_log = logging.getLogger("discord.client")
     client_log.addFilter(reconnects)

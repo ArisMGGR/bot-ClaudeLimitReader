@@ -26,7 +26,8 @@ SERVICE_NAME = "claude-limit-reader-bot.service"
 TASK_NAME = "claude-limit-reader-bot"  # Windows task names take no suffix.
 
 SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
-USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+USER_UNIT_SUBDIR = Path(".config") / "systemd" / "user"
+USER_UNIT_DIR = Path.home() / USER_UNIT_SUBDIR
 
 # Bot tokens the loader accepts from the environment. They are secrets, so on
 # systemd they go into an owner-only EnvironmentFile rather than the unit,
@@ -49,6 +50,17 @@ def backend() -> str:
     if shutil.which("systemctl") and Path("/run/systemd/system").exists():
         return "systemd"
     return ""
+
+
+def require_backend() -> str:
+    """backend(), or a ServiceError naming the missing service manager."""
+    kind = backend()
+    if not kind:
+        raise ServiceError(
+            "no supported service manager here (need systemd or Windows Task "
+            "Scheduler); keep using `python run.py run`"
+        )
+    return kind
 
 
 def entry_point() -> tuple[str, Path]:
@@ -118,8 +130,12 @@ def service_environment(config_path: Path | None = None) -> dict[str, str]:
 
 
 def token_environment() -> dict[str, str]:
-    """Bot tokens set in this shell, which the service must be given too."""
-    return {name: os.environ[name] for name in TOKEN_ENV_VARS if os.environ.get(name)}
+    """Bot tokens set in this shell, which the service must be given too.
+
+    Stripped, as the loader strips them: a whitespace-only value counts as unset.
+    """
+    tokens = {name: os.environ.get(name, "").strip() for name in TOKEN_ENV_VARS}
+    return {name: value for name, value in tokens.items() if value}
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -215,7 +231,9 @@ def render_unit(options: UnitOptions | None = None) -> str:
         "ProtectControlGroups=true",
         "RestrictSUIDSGID=true",
         f"ReadWritePaths={_unit_quote(str(service_app_dir()))}",
-        f"ReadWritePaths={_unit_quote(str(LOG_DIR))}",
+        # '-': a deleted logs/ must not stop the unit starting; the bot
+        # then logs to the journal only, since it cannot recreate the folder.
+        f"ReadWritePaths={_unit_quote('-' + str(LOG_DIR))}",
         "",
         "[Install]",
         f"WantedBy={'multi-user.target' if opts.system_scope else 'default.target'}",
@@ -240,6 +258,39 @@ def unit_path(system_scope: bool = False) -> Path:
     return (SYSTEM_UNIT_DIR if system_scope else USER_UNIT_DIR) / SERVICE_NAME
 
 
+def _written_by_install(path: Path) -> bool:
+    """Whether a file is a service.env as `install` writes it: CLR_*_TOKEN lines only.
+
+    A unit set up by hand from `service show` can name an environment file of
+    the user's own, which must never be deleted along with the unit.
+    """
+    if path.name != SERVICE_ENV.name:
+        return False
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln]
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(lines) and all(ln.split("=", 1)[0] in TOKEN_ENV_VARS for ln in lines)
+
+
+def _unit_env_file(unit: Path) -> Path | None:
+    """The service.env an installed unit reads, if `install` wrote it; else None.
+
+    It lies in the app dir of the shell that installed the unit, which need
+    not be this shell's (CLR_HOME), so read it from the unit itself.
+    """
+    prefix = "EnvironmentFile=-"
+    try:
+        lines = unit.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith(prefix):
+            path = Path(line[len(prefix):].replace("%%", "%"))
+            return path if _written_by_install(path) else None
+    return None
+
+
 def _systemctl(system_scope: bool, *args: str) -> subprocess.CompletedProcess:
     cmd = ["systemctl"] + ([] if system_scope else ["--user"]) + list(args)
     return _run(cmd)
@@ -252,11 +303,27 @@ def _install_systemd(system_scope: bool, config_path: Path | None) -> str:
             "to install it for your user only"
         )
 
+    # The two scopes are alternatives, like the Windows task and Startup
+    # launcher: side by side, both units would start a bot.
+    other = _other_unit(system_scope)
+    if other is not None:
+        if system_scope:
+            raise ServiceError(
+                f"a user unit is already installed at {other}; remove it first with "
+                "`python run.py service uninstall` (without sudo), then re-run this"
+            )
+        raise ServiceError(
+            f"a system unit is already installed at {other}; update it with "
+            f"`sudo -E {sys.executable} run.py service install --system`, or remove it "
+            "first with `sudo python run.py service uninstall --system`"
+        )
+
     # Under sudo, run the service as the user who owns the tokens.
     user = os.environ.get("SUDO_USER")
 
-    # ReadWritePaths= refuses to start the unit if a path is missing, and the
-    # service cannot create one itself once ProtectSystem=strict is in force.
+    # ReadWritePaths= refuses to start the unit if the app dir is missing (logs/
+    # is '-'-prefixed, so it is only skipped), and the service cannot create
+    # either itself once ProtectSystem=strict is in force.
     app_dir = service_app_dir()
     for directory in (app_dir, LOG_DIR):
         if not directory.exists():
@@ -269,6 +336,7 @@ def _install_systemd(system_scope: bool, config_path: Path | None) -> str:
             if user:
                 shutil.chown(directory, user=user)
 
+    path = unit_path(system_scope)
     env_path = service_env_path()
     env_text = render_service_env()
     if env_text:
@@ -277,8 +345,11 @@ def _install_systemd(system_scope: bool, config_path: Path | None) -> str:
             shutil.chown(env_path, user=user)
     else:
         env_path.unlink(missing_ok=True)  # no stale tokens from an earlier install
+    # An earlier install under another CLR_HOME left its tokens there.
+    previous = _unit_env_file(path)
+    if previous is not None and previous != env_path:
+        previous.unlink(missing_ok=True)
 
-    path = unit_path(system_scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         render_unit(
@@ -314,16 +385,30 @@ def _install_systemd(system_scope: bool, config_path: Path | None) -> str:
     return note
 
 
+def _other_unit(system_scope: bool) -> Path | None:
+    """The unit installed in the other scope, if there is one.
+
+    Under sudo, a user unit belongs to SUDO_USER, whose home HOME may not be.
+    """
+    path = unit_path(not system_scope)
+    geteuid = getattr(os, "geteuid", None)
+    user = os.environ.get("SUDO_USER")
+    if system_scope and user and geteuid is not None and geteuid() == 0:
+        try:
+            path = _home_of(user) / USER_UNIT_SUBDIR / SERVICE_NAME
+        except (ImportError, KeyError):
+            pass
+    return path if path.exists() else None
+
+
 def _other_scope_hint(system_scope: bool) -> str:
-    """Point at the other scope when the unit is installed there instead."""
-    if not unit_path(not system_scope).exists():
+    """Point at the other scope when a unit is installed there."""
+    other = _other_unit(system_scope)
+    if other is None:
         return ""
     if system_scope:
-        return "\nThere is a user unit; drop --system to act on it."
-    return (
-        "\nThere is a system unit at "
-        f"{unit_path(True)}; add --system (as root) to act on it."
-    )
+        return f"\nThere is a user unit at {other}; drop --system to act on it."
+    return f"\nThere is a system unit at {other}; add --system (as root) to act on it."
 
 
 def _uninstall_systemd(system_scope: bool) -> str:
@@ -336,9 +421,13 @@ def _uninstall_systemd(system_scope: bool) -> str:
 
     # Ignore a failure here: a unit that never started still needs its file gone.
     _systemctl(system_scope, "disable", "--now", SERVICE_NAME)
+    # The tokens the unit names, wherever it was installed from, and this
+    # shell's own (an install without tokens references none).
+    env_files = {service_env_path(), _unit_env_file(path)} - {None}
     try:
         path.unlink()
-        service_env_path().unlink(missing_ok=True)
+        for env_file in env_files:
+            env_file.unlink(missing_ok=True)
     except OSError as e:
         raise ServiceError(f"could not remove {path}: {e}") from e
     _systemctl(system_scope, "daemon-reload")
@@ -358,6 +447,7 @@ def _status_systemd(system_scope: bool) -> str:
         f"Active  : {active or 'unknown'}\n"
         f"Enabled : {enabled or 'unknown'}\n"
         f"Logs    : {logs} -u {SERVICE_NAME} -f"
+        f"{_other_scope_hint(system_scope)}"
     )
 
 
@@ -374,8 +464,17 @@ STARTUP_DIR = (
     / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 )
 STARTUP_SCRIPT = STARTUP_DIR / f"{TASK_NAME}.cmd"
-TASK_LAUNCHER = APP_DIR / f"{TASK_NAME}.cmd"
-PID_FILE = APP_DIR / "service.pid"
+# Not in APP_DIR: that follows CLR_HOME, so a shell without the install's
+# CLR_HOME could neither find the launcher (it holds the tokens) to remove
+# it nor the running bot to stop. The bot, started by the launcher as the
+# same user, sees the same LOCALAPPDATA.
+SERVICE_STATE_DIR = (
+    Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / TASK_NAME
+).absolute()
+TASK_LAUNCHER = SERVICE_STATE_DIR / f"{TASK_NAME}.cmd"
+PID_FILE = SERVICE_STATE_DIR / "service.pid"
+# Where earlier versions kept the task launcher; uninstall removes it too.
+LEGACY_TASK_LAUNCHER = APP_DIR / f"{TASK_NAME}.cmd"
 
 # Set by the launcher and by the install-time spawn, so a bot started as the
 # service records itself in service.pid (see record_running_instance).
@@ -531,8 +630,10 @@ def _spawn_detached(config_path: Path | None = None) -> int:
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
         subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
+    # Not this shell's CLR_CONFIG: the launcher sets one only when it differs
+    # from CLR_HOME/config.toml, and a bad one would stop the bot.
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k != "CLR_CONFIG"},
         **service_environment(config_path),
         **token_environment(),
         SERVICE_FLAG: "1",
@@ -621,7 +722,7 @@ def _uninstall_windows() -> str:
             _fail(f"schtasks /Delete {TASK_NAME}", proc)
         removed.append(f"scheduled task {TASK_NAME}")
 
-    for launcher in (TASK_LAUNCHER, STARTUP_SCRIPT):
+    for launcher in (TASK_LAUNCHER, STARTUP_SCRIPT, LEGACY_TASK_LAUNCHER):
         if launcher.exists():
             launcher.unlink()
             removed.append(str(launcher))
@@ -678,24 +779,15 @@ def _status_windows() -> str:
 
 
 def install(system_scope: bool = False, config_path: Path | None = None) -> str:
-    kind = backend()
-    if kind == "systemd":
+    if require_backend() == "systemd":
         return _install_systemd(system_scope, config_path)
-    if kind == "windows":
-        return _install_windows(config_path)
-    raise ServiceError(
-        "no supported service manager here (need systemd or Windows Task "
-        "Scheduler); keep using `python run.py run`"
-    )
+    return _install_windows(config_path)
 
 
 def uninstall(system_scope: bool = False) -> str:
-    kind = backend()
-    if kind == "systemd":
+    if require_backend() == "systemd":
         return _uninstall_systemd(system_scope)
-    if kind == "windows":
-        return _uninstall_windows()
-    raise ServiceError("no supported service manager here")
+    return _uninstall_windows()
 
 
 def status(system_scope: bool = False) -> str:

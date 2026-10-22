@@ -9,16 +9,51 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# An empty variable counts as unset, as it does for the tokens; Path("") would
-# otherwise mean the current directory. Both are made absolute here: a service
-# runs from another working directory, and systemd ignores relative paths.
-APP_DIR = Path(
-    os.environ.get("CLR_HOME") or Path.home() / ".claudelimitreader"
-).expanduser().absolute()
+
+class ConfigError(Exception):
+    """Raised when a config file named explicitly is missing, or any is malformed."""
+
+
+def expand_path(raw, what: str) -> Path:
+    """Path(raw).expanduser(), with an unknown ~user as a ConfigError.
+
+    On POSIX, `~name` for an account that does not exist raises RuntimeError,
+    which would otherwise end the command in a traceback.
+    """
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError:
+        raise ConfigError(f"{what}{raw}: no user's home directory matches that ~") from None
+
+
+# The error for each of CLR_HOME / CLR_CONFIG that cannot be expanded. This
+# module is imported before logging starts, so main() raises it once the log
+# file is open.
+_PATH_ERRORS: dict[str, ConfigError] = {}
+
+
+def _env_path(name: str, default: Path) -> Path:
+    # An empty variable counts as unset, as it does for the tokens; Path("")
+    # would otherwise mean the current directory.
+    raw = os.environ.get(name) or default
+    try:
+        path = expand_path(raw, f"{name}=")
+    except ConfigError as e:
+        _PATH_ERRORS[name] = e
+        path = Path(raw)  # a placeholder only; main() refuses to use it
+    # Absolute: a service runs from another working directory, and systemd
+    # ignores relative paths.
+    return path.absolute()
+
+
+APP_DIR = _env_path("CLR_HOME", Path.home() / ".claudelimitreader")
 TOKEN_PATH = APP_DIR / "tokens.json"
-DEFAULT_CONFIG_PATH = Path(
-    os.environ.get("CLR_CONFIG") or APP_DIR / "config.toml"
-).expanduser().absolute()
+DEFAULT_CONFIG_PATH = _env_path("CLR_CONFIG", APP_DIR / "config.toml")
+
+# Every command uses the app dir, so a bad CLR_HOME stops them all; a bad
+# CLR_CONFIG stops only those that read the default config.
+PATH_ERROR = _PATH_ERRORS.get("CLR_HOME")
+CONFIG_PATH_ERROR = _PATH_ERRORS.get("CLR_CONFIG")
 
 # OAuth client identity used by Claude Code. The bot performs its own
 # authorization against this client so it never shares a refresh-token lineage
@@ -31,10 +66,6 @@ USER_AGENT = "claudelimitreader/1.0"
 
 # Refreshed access tokens live ~8h; renew a little early to avoid edge races.
 REFRESH_SKEW_SECONDS = 300
-
-
-class ConfigError(Exception):
-    """Raised when a config file named explicitly is missing, or any is malformed."""
 
 
 @dataclass
@@ -116,6 +147,16 @@ def _str(section: dict, key: str, where: str) -> str:
     return value
 
 
+def _token(section: dict, name: str) -> str:
+    """A bot token: CLR_<NAME>_TOKEN if set, else the file's, without surrounding whitespace.
+
+    python-telegram-bot puts the token in the request URL verbatim, so a stray
+    space or a CR from a CRLF file would otherwise reach Telegram.
+    """
+    env = os.environ.get(f"CLR_{name.upper()}_TOKEN", "").strip()
+    return env or _str(section, "token", f"{name}.token").strip()
+
+
 def _number(section: dict, key: str, default: float, where: str) -> float:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -129,6 +170,9 @@ def _number(section: dict, key: str, default: float, where: str) -> float:
     return number
 
 
+EMPTY_CONFIG_PATH = "-c was given an empty path; name a config file, or leave -c out"
+
+
 def load_config(path: Path | None = None, *, check_platforms: bool = True) -> Config:
     """Read config.toml, applying environment overrides for the bot tokens.
 
@@ -136,9 +180,12 @@ def load_config(path: Path | None = None, *, check_platforms: bool = True) -> Co
     (-c) must exist. check_platforms=False skips the token and allowed-user
     checks, for commands that never start a bot.
     """
-    explicit = bool(path)
+    explicit = path is not None
+    if explicit and not str(path).strip():
+        # `-c "$UNSET"` must not quietly fall back to the default config.
+        raise ConfigError(EMPTY_CONFIG_PATH)
     # expanduser, as for CLR_CONFIG: a quoted -c "~/x.toml" reaches us unexpanded.
-    path = Path(path).expanduser() if path else DEFAULT_CONFIG_PATH
+    path = expand_path(path, "-c ") if explicit else DEFAULT_CONFIG_PATH
     if explicit and not path.exists():
         raise ConfigError(f"{path} does not exist")
 
@@ -166,13 +213,13 @@ def load_config(path: Path | None = None, *, check_platforms: bool = True) -> Co
 
     discord = DiscordConfig(
         enabled=_bool(d, "enabled", "discord.enabled"),
-        token=os.environ.get("CLR_DISCORD_TOKEN") or _str(d, "token", "discord.token"),
+        token=_token(d, "discord"),
         allowed_user_ids=_as_int_list(d.get("allowed_user_ids"), "discord.allowed_user_ids"),
         guild_id=guild_id,
     )
     telegram = TelegramConfig(
         enabled=_bool(t, "enabled", "telegram.enabled"),
-        token=os.environ.get("CLR_TELEGRAM_TOKEN") or _str(t, "token", "telegram.token"),
+        token=_token(t, "telegram"),
         allowed_user_ids=_as_int_list(t.get("allowed_user_ids"), "telegram.allowed_user_ids"),
     )
     pace = PaceConfig(

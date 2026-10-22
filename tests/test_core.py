@@ -106,7 +106,7 @@ class TestParse(unittest.TestCase):
         self.assertEqual([w.key for w in parse_usage(payload).windows], ["five_hour"])
 
     def test_non_finite_percent_is_skipped(self):
-        # json.loads accepts NaN/Infinity; NaN used to crash the bar (F-031).
+        # json.loads accepts NaN/Infinity; NaN used to crash the bar.
         payload = {"limits": [{"kind": "session", "percent": float("nan")},
                               {"kind": "weekly_all", "percent": "inf"}],
                    "five_hour": {"utilization": 20.0, "resets_at": None}}
@@ -189,7 +189,7 @@ class TestPace(unittest.TestCase):
         self.assertEqual(p.window.duration, dt.timedelta(hours=5))
 
     def test_extreme_server_values_do_not_break_the_report(self):
-        """A tiny percent or a year-1 reset overflowed the datetime maths (F-064)."""
+        """A tiny percent or a year-1 reset overflowed the datetime maths."""
         now = dt.datetime.now(UTC)
         for label, entry in (
             ("tiny percent", {"percent": 1e-4,
@@ -233,7 +233,7 @@ class TestRender(unittest.TestCase):
             self.assertEqual(overall_color(report), COLOR_WARN)
 
     def test_embed_color_follows_the_server_severity_like_the_icon(self):
-        """A severity the icon shows must colour the embed too (F-048)."""
+        """A severity the icon shows must colour the embed too."""
         for severity, icon, color in (("critical", "🔴", COLOR_CRIT), ("warning", "🟡", COLOR_WARN)):
             with self.subTest(severity):
                 report = parse_usage({"limits": [
@@ -253,7 +253,7 @@ class TestRender(unittest.TestCase):
         ]})
 
     def test_a_session_pace_the_report_never_shows_does_not_colour_it(self):
-        """Green icons and a green weekly pace make a green embed (F-053)."""
+        """Green icons and a green weekly pace make a green embed."""
         report = self.burning_session(40)
         self.assertEqual({_severity_icon(w) for w in report.windows}, {"🟢"})
         self.assertIn("Comfortably under", pace_block(report))

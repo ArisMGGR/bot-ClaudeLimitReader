@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from clr import setup  # noqa: E402
 
 
-def args(config=None):
-    return types.SimpleNamespace(config=config)
+def args(config=None, verbose=False):
+    return types.SimpleNamespace(config=config, verbose=verbose)
 
 
 class VenvPathTest(unittest.TestCase):
@@ -28,7 +28,7 @@ class VenvPathTest(unittest.TestCase):
         self.assertTrue(got.name.startswith("python"))
 
     # Debian and Ubuntu ship ensurepip separately (python3-venv); without it
-    # no venv can be built here, which setup reports on its own (F-059).
+    # no venv can be built here, which setup reports on its own.
     @unittest.skipIf(importlib.util.find_spec("ensurepip") is None,
                      "ensurepip is not installed (python3-venv on Debian/Ubuntu)")
     def test_creates_a_usable_interpreter(self):
@@ -54,11 +54,11 @@ class VenvPathTest(unittest.TestCase):
 
 
 class HandoffTest(unittest.TestCase):
-    def _capture(self, cfg=None):
+    def _capture(self, cfg=None, verbose=False):
         done = subprocess.CompletedProcess([], 0)
         with mock.patch.object(subprocess, "run", return_value=done) as run:
             with contextlib.redirect_stdout(io.StringIO()):
-                code = setup._handoff(Path("/proj/venv/bin/python"), args(cfg))
+                code = setup._handoff(Path("/proj/venv/bin/python"), args(cfg, verbose))
         return code, run.call_args
 
     def test_reruns_setup_under_the_venv(self):
@@ -74,6 +74,12 @@ class HandoffTest(unittest.TestCase):
         cmd = call.args[0]
         self.assertIn("-c", cmd)
         self.assertEqual(cmd[cmd.index("-c") + 1], "/srv/other.toml")
+
+    def test_carries_verbose(self):
+        """`-v setup` keeps debug logging after the handoff."""
+        cmd = self._capture(verbose=True)[1].args[0]
+        self.assertLess(cmd.index("-v"), cmd.index("setup"))
+        self.assertNotIn("-v", self._capture()[1].args[0])
 
     def test_child_is_flagged_so_it_cannot_hand_off_again(self):
         _, call = self._capture()

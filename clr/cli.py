@@ -10,7 +10,17 @@ import sys
 from pathlib import Path
 
 from .auth import AuthError, load_tokens
-from .config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config, ConfigError, load_config
+from .config import (
+    CONFIG_PATH_ERROR,
+    DEFAULT_CONFIG_PATH,
+    EMPTY_CONFIG_PATH,
+    PATH_ERROR,
+    TOKEN_PATH,
+    Config,
+    ConfigError,
+    expand_path,
+    load_config,
+)
 from .logs import Outage, build_handler as build_log_handler, heartbeat
 from .render import render_plain
 from .service import ServiceError, record_running_instance
@@ -44,6 +54,10 @@ def _not_file_only(record: logging.LogRecord) -> bool:
     return not getattr(record, "file_only", False)
 
 
+def _not_voice_warning(record: logging.LogRecord) -> bool:
+    return not str(record.msg).endswith("voice will NOT be supported")
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -58,6 +72,12 @@ def _setup_logging(verbose: bool) -> None:
         logging.getLogger("clr").warning("file logging disabled: %s", e)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("discord").setLevel(logging.WARNING)
+    # python-telegram-bot logs its API URL, which embeds the bot token, at
+    # DEBUG; -v must not write the token into logs/.
+    logging.getLogger("telegram").setLevel(logging.INFO)
+    # The bot never joins voice, so discord.py's warning that the voice
+    # libraries are missing is noise in every start's log.
+    logging.getLogger("discord.client").addFilter(_not_voice_warning)
 
 
 # ---------------------------------------------------------------- subcommands
@@ -88,6 +108,8 @@ def cmd_service(args) -> int:
 
     if args.action == "install":
         cfg_path = Path(args.config) if args.config else None
+        # No service manager makes the config checks moot; say that first.
+        service.require_backend()
         check_install(cfg_path)
         print(service.install(system_scope=args.system, config_path=cfg_path))
     elif args.action == "uninstall":
@@ -129,8 +151,15 @@ def cmd_usage(args) -> int:
     return 0
 
 
+# Telegram gives no "back online" signal, so a gap this long without a polling
+# failure ends an outage. During one, polling retries at most 30s apart plus the
+# request's own timeouts; a longer gap means polling succeeded in between, and
+# failures minutes apart must not add up to "still down".
+TELEGRAM_QUIET_GAP = 90
+
+
 async def _run_telegram(cfg: Config) -> None:
-    from telegram.error import NetworkError
+    from telegram.error import InvalidToken, NetworkError
 
     from .bots import retry_startup
     from .bots.telegram_bot import build_application
@@ -149,11 +178,19 @@ async def _run_telegram(cfg: Config) -> None:
             raise
         return app
 
-    app = await retry_startup("telegram", initialize, (NetworkError,))
+    try:
+        app = await retry_startup("telegram", initialize, (NetworkError,))
+    except InvalidToken:
+        # The library's message quotes the whole token; keep it out of the log.
+        raise ConfigError(
+            "Telegram rejected the bot token; check telegram.token (or "
+            "CLR_TELEGRAM_TOKEN), and get a new one from @BotFather if it was revoked"
+        ) from None
     await app.start()
     # Polling failures get one line each instead of the library's traceback.
-    # Polling retries at most 30s apart, so five quiet minutes end an outage.
-    outage = Outage(logging.getLogger("clr.telegram"), "Telegram polling", quiet_gap=5 * 60)
+    outage = Outage(
+        logging.getLogger("clr.telegram"), "Telegram polling", quiet_gap=TELEGRAM_QUIET_GAP
+    )
     # -1: keep retrying the polling bootstrap too, rather than exiting on it.
     await app.updater.start_polling(bootstrap_retries=-1, error_callback=outage.failed)
     try:
@@ -281,14 +318,31 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _reads_default_config(args) -> bool:
+    """Whether this command reads DEFAULT_CONFIG_PATH, and so CLR_CONFIG."""
+    if args.config:
+        return False
+    if args.command == "service":
+        return args.action in ("install", "show")
+    return args.command != "login"
+
+
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_output()
     args = build_parser().parse_args(argv)
-    if args.config:
-        # Once here, so every command reads the file the service would (F-058).
-        args.config = str(Path(args.config).expanduser())
     _setup_logging(args.verbose)
     try:
+        if PATH_ERROR is not None:  # CLR_HOME names no home
+            raise PATH_ERROR
+        if args.config is not None and not args.config.strip():
+            # Every command below reads `if args.config`, which would take
+            # an empty one for none at all and use the default config.
+            raise ConfigError(EMPTY_CONFIG_PATH)
+        if CONFIG_PATH_ERROR is not None and _reads_default_config(args):  # CLR_CONFIG
+            raise CONFIG_PATH_ERROR
+        if args.config:
+            # Once here, so every command reads the file the service would.
+            args.config = str(expand_path(args.config, "-c "))
         return args.func(args)
     except (AuthError, UsageError, ConfigError, ServiceError) as e:
         # Printed for a terminal, and logged because under the background

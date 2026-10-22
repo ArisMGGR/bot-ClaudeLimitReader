@@ -20,8 +20,8 @@ from clr.config import Config, ConfigError, DiscordConfig, TelegramConfig  # noq
 NO_CLR_ENV = {k: v for k, v in os.environ.items() if not k.startswith("CLR_")}
 
 
-class MainLogsFailuresTest(unittest.TestCase):
-    """Under pythonw.exe there is no console, so failures must reach the log (F-006)."""
+class LogDirTestCase(unittest.TestCase):
+    """logs/ in a temp dir, and the root logger restored after each test."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -50,6 +50,10 @@ class MainLogsFailuresTest(unittest.TestCase):
     def log_text(self):
         return "".join(p.read_text(encoding="utf-8") for p in (self.dir / "logs").glob("*.log"))
 
+
+class MainLogsFailuresTest(LogDirTestCase):
+    """Under pythonw.exe there is no console, so failures must reach the log."""
+
     def test_config_error_is_written_to_the_log_file(self):
         config = self.dir / "config.toml"
         config.write_text('[discord]\nenabled = true\ntoken = ""\nallowed_user_ids = [1]\n')
@@ -76,7 +80,7 @@ class MainLogsFailuresTest(unittest.TestCase):
         self.assertIn("No platform enabled", self.log_text())
 
     def test_a_tilde_config_path_is_expanded_for_every_command(self):
-        """status and setup read args.config themselves, not via load_config (F-058)."""
+        """status and setup read args.config themselves, not via load_config."""
         home = self.dir / "home"
         home.mkdir()
         (home / "clr.toml").write_text("", encoding="utf-8")
@@ -90,6 +94,80 @@ class MainLogsFailuresTest(unittest.TestCase):
         line = next(ln for ln in out.getvalue().splitlines() if ln.startswith("Config"))
         self.assertIn(str(home / "clr.toml"), line)
         self.assertNotIn("[missing]", line)
+
+    def test_an_unknown_home_in_c_is_a_logged_error(self):
+        """POSIX `-c ~nosuchuser/x`: an Error line and a log record, not a traceback."""
+        def no_home(path):
+            raise RuntimeError("Could not determine home directory.")
+
+        with mock.patch.dict(os.environ, NO_CLR_ENV, clear=True), \
+             mock.patch.object(Path, "expanduser", no_home):
+            code, err = self.main("-c", "~nosuchuser/x.toml", "status")
+        self.assertEqual(code, 1)
+        self.assertIn("Error: -c ~nosuchuser/x.toml", err)
+        self.assertIn("~nosuchuser/x.toml", self.log_text())
+
+    def test_an_empty_c_is_refused_not_read_as_the_default(self):
+        """`-c "$UNSET"` names no file; using the default config instead would hide it."""
+        for argv, command in (
+            (["status"], "cmd_status"),
+            (["usage"], "cmd_usage"),
+            (["run"], "cmd_run"),
+            (["setup"], "cmd_setup"),
+            (["service", "install"], "cmd_service"),
+        ):
+            for empty in ("", "  "):
+                with self.subTest(argv=argv, empty=empty), \
+                     mock.patch.dict(os.environ, NO_CLR_ENV, clear=True), \
+                     mock.patch.object(cli, command) as run:
+                    code, err = self.main("-c", empty, *argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn("-c was given an empty path", err)
+                    run.assert_not_called()
+        self.assertIn("run failed: -c was given an empty path", self.log_text())
+
+    def test_an_unknown_home_in_the_environment_stops_every_command(self):
+        """CLR_HOME / CLR_CONFIG that cannot expand are reported once logging is up."""
+        error = ConfigError("CLR_HOME=~nosuchuser: no user's home directory matches that ~")
+        with mock.patch.object(cli, "PATH_ERROR", error), \
+             mock.patch.object(cli, "cmd_status") as status:
+            code, err = self.main("status")
+        self.assertEqual(code, 1)
+        status.assert_not_called()
+        self.assertIn("CLR_HOME=~nosuchuser", err)
+        self.assertIn("status failed: CLR_HOME=~nosuchuser", self.log_text())
+
+    def test_a_bad_clr_config_stops_only_commands_that_read_it(self):
+        """-c, `login`, `service status` and `uninstall` never read CLR_CONFIG."""
+        error = ConfigError("CLR_CONFIG=~nosuchuser/c.toml: no user's home directory matches that ~")
+        config = self.dir / "real.toml"
+        config.write_text("", encoding="utf-8")
+        for argv, command in (
+            (["-c", str(config), "status"], "cmd_status"),
+            (["-c", str(config), "usage"], "cmd_usage"),
+            (["login"], "cmd_login"),
+            (["service", "status"], "cmd_service"),
+            (["service", "uninstall"], "cmd_service"),
+        ):
+            with self.subTest(argv=argv), \
+                 mock.patch.object(cli, "CONFIG_PATH_ERROR", error), \
+                 mock.patch.object(cli, command, return_value=0) as run:
+                self.assertEqual(self.main(*argv)[0], 0)
+                run.assert_called_once()
+        for argv, command in (
+            (["status"], "cmd_status"),
+            (["run"], "cmd_run"),
+            (["service", "install"], "cmd_service"),
+            (["service", "show"], "cmd_service"),
+            (["setup"], "cmd_setup"),
+        ):
+            with self.subTest(argv=argv), \
+                 mock.patch.object(cli, "CONFIG_PATH_ERROR", error), \
+                 mock.patch.object(cli, command, return_value=0) as run:
+                code, err = self.main(*argv)
+                self.assertEqual(code, 1)
+                self.assertIn("CLR_CONFIG=~nosuchuser", err)
+                run.assert_not_called()
 
     def test_unexpected_exceptions_are_logged_and_raised(self):
         def boom(args):
@@ -124,7 +202,7 @@ class ConfigUseTest(unittest.TestCase):
         return path
 
     def test_usage_needs_no_bot_token(self):
-        """Only `run` starts a bot, so only `run` checks for its token (F-033)."""
+        """Only `run` starts a bot, so only `run` checks for its token."""
         path = self.config('[discord]\nenabled = true\ntoken = ""\nallowed_user_ids = [1]\n')
         with mock.patch.dict(os.environ, NO_CLR_ENV, clear=True), \
              mock.patch.object(cli, "fetch_usage"), \
@@ -133,17 +211,33 @@ class ConfigUseTest(unittest.TestCase):
             self.assertEqual(cli.cmd_usage(types.SimpleNamespace(config=str(path))), 0)
 
     def test_install_refuses_a_missing_config(self):
-        """No service is installed for a mistyped -c path (F-034)."""
+        """No service is installed for a mistyped -c path."""
         missing = Path(tempfile.mkdtemp()) / "typo.toml"
         args = types.SimpleNamespace(action="install", config=str(missing), system=False)
-        with mock.patch("clr.service.install") as install:
-            with self.assertRaises(ConfigError):
+        with mock.patch("clr.service.backend", return_value="systemd"), \
+             mock.patch("clr.service.install") as install:
+            with self.assertRaises(ConfigError) as ctx:
                 cli.cmd_service(args)
         install.assert_not_called()
+        # The -c file itself was checked, not the default config.
+        self.assertIn(str(missing), str(ctx.exception))
+
+    def test_install_without_a_service_manager_says_so_first(self):
+        """No config advice on a host that has nothing to install into."""
+        from clr.service import ServiceError
+
+        missing = Path(tempfile.mkdtemp()) / "typo.toml"
+        args = types.SimpleNamespace(action="install", config=str(missing), system=False)
+        with mock.patch("clr.service.backend", return_value=""), \
+             mock.patch.object(cli, "check_install") as check:
+            with self.assertRaises(ServiceError) as ctx:
+                cli.cmd_service(args)
+        self.assertIn("no supported service manager", str(ctx.exception))
+        check.assert_not_called()
 
 
 class InstallPreflightTest(unittest.TestCase):
-    """`service install` refuses whatever `run` would refuse (F-044)."""
+    """`service install` refuses whatever `run` would refuse."""
 
     ENABLED = '[discord]\nenabled = true\ntoken = "t"\nallowed_user_ids = [1]\n'
 
@@ -157,6 +251,7 @@ class InstallPreflightTest(unittest.TestCase):
         spec = object() if library else None
         env = {**NO_CLR_ENV, **({"CLR_HOME": str(app)} if clr_home else {})}
         with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("clr.service.backend", return_value="systemd"), \
              mock.patch("clr.service.service_app_dir", return_value=app), \
              mock.patch("importlib.util.find_spec", return_value=spec), \
              mock.patch("clr.service.install", return_value="installed") as install, \
@@ -192,7 +287,7 @@ class InstallPreflightTest(unittest.TestCase):
         # As under sudo with HOME=/root: this shell's default config is empty or
         # absent, and only the service's app dir holds the real one. cli binds
         # its own DEFAULT_CONFIG_PATH at import, so patch that name too; else a
-        # real ~/.claudelimitreader/config.toml would stand in for it (F-047).
+        # real ~/.claudelimitreader/config.toml would stand in for it.
         nowhere = Path("/nonexistent/config.toml")
         with mock.patch("clr.config.DEFAULT_CONFIG_PATH", nowhere), \
              mock.patch.object(cli, "DEFAULT_CONFIG_PATH", nowhere), \
@@ -204,7 +299,7 @@ class InstallPreflightTest(unittest.TestCase):
 
 
 class RunStartupTest(unittest.TestCase):
-    """What `run` does between its preflight and starting the bots (F-056)."""
+    """What `run` does between its preflight and starting the bots."""
 
     def run_cmd(self, load_tokens=None):
         calls = []
@@ -239,7 +334,7 @@ class RunStartupTest(unittest.TestCase):
 
 
 class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
-    """A network that is not up yet at logon must not end the bot (F-042)."""
+    """A network that is not up yet at logon must not end the bot."""
 
     async def test_transient_failures_are_retried_with_backoff(self):
         from clr import bots
@@ -270,6 +365,48 @@ class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             await bots.retry_startup("test", attempt, (OSError,))
+
+    async def failing_start(self, failures, exc=OSError("no route")):
+        """Run retry_startup through `failures` transient errors on a fake clock."""
+        from clr import bots
+
+        clock, delays = [1_000_000.0], []
+        outcomes = [exc] * failures + ["connected"]
+
+        async def attempt():
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        async def sleep(seconds):
+            delays.append(seconds)
+            clock[0] += seconds
+
+        with mock.patch.object(bots.asyncio, "sleep", sleep), \
+             mock.patch.object(logs.time, "time", lambda: clock[0]), \
+             self.assertLogs("clr", level="INFO") as cm:
+            await bots.retry_startup("test", attempt, (OSError,))
+        return delays, cm.records
+
+    async def test_backoff_stops_at_the_ceiling(self):
+        """5s doubling to at most 300s."""
+        from clr import bots
+
+        delays, _ = await self.failing_start(10)
+        self.assertEqual(delays, [5, 10, 20, 40, 80, 160, 300, 300, 300, 300])
+        self.assertEqual(max(delays), bots.MAX_RETRY_DELAY)
+
+    async def test_startup_failures_are_logged_like_an_outage(self):
+        """A cause for message-less errors, one ERROR past 15 minutes, one INFO at the end."""
+        _, records = await self.failing_start(10, TimeoutError())
+        levels = [r.levelname for r in records]
+        self.assertEqual(levels.count("ERROR"), 1, levels)
+        self.assertEqual(levels[-1], "INFO")
+        self.assertIn("back after", records[-1].getMessage())
+        warning = records[0].getMessage()
+        self.assertIn("TimeoutError", warning)
+        self.assertNotIn("()", warning)
 
 
 class LibraryCheckTest(unittest.TestCase):
@@ -315,10 +452,45 @@ except ImportError:  # python-telegram-bot is optional
     telegram_bot = None
 
 
+class LibraryLogTest(LogDirTestCase):
+    """What the platform libraries log that must not reach logs/."""
+
+    def setUp(self):
+        super().setUp()
+        telegram_log = logging.getLogger("telegram")
+        self.addCleanup(telegram_log.setLevel, telegram_log.level)
+        self.addCleanup(logging.getLogger("discord.client").removeFilter, cli._not_voice_warning)
+
+    @unittest.skipIf(telegram_bot is None, "python-telegram-bot is not installed")
+    def test_debug_logging_keeps_the_telegram_token_out(self):
+        """-v: python-telegram-bot logs its API URL, token included, at DEBUG."""
+        cfg = Config(telegram=TelegramConfig(enabled=True, token="123456:sekrit-7f3a",
+                                             allowed_user_ids=[1]))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cli._setup_logging(verbose=True)
+            telegram_bot.build_application(cfg)
+        self.assertNotIn("sekrit-7f3a", self.log_text())
+        self.assertNotIn("sekrit-7f3a", err.getvalue())
+
+    def test_the_missing_voice_library_warning_is_dropped(self):
+        """The bot never joins voice; other discord.client warnings still get through."""
+        client_log = logging.getLogger("discord.client")
+        with contextlib.redirect_stderr(io.StringIO()):
+            cli._setup_logging(verbose=False)
+            # What discord.py's Client.__init__ logs without PyNaCl or davey.
+            client_log.warning("PyNaCl is not installed, voice will NOT be supported")
+            client_log.warning("davey is not installed, voice will NOT be supported")
+            client_log.warning("Shard ID None heartbeat blocked for more than 10 seconds.")
+        text = self.log_text()
+        self.assertNotIn("voice will NOT be supported", text)
+        self.assertIn("heartbeat blocked", text)
+
+
 @unittest.skipIf(telegram_bot is None, "python-telegram-bot is not installed")
 class TelegramLifecycleTest(unittest.TestCase):
     def test_post_init_registers_commands(self):
-        """initialize()/start() alone never call post_init (F-010)."""
+        """initialize()/start() alone never call post_init."""
         app = FakeApp()
 
         async def run():
@@ -334,7 +506,7 @@ class TelegramLifecycleTest(unittest.TestCase):
         self.assertLess(app.calls.index("post_init"), app.calls.index("start"))
 
     def test_network_failure_at_initialize_is_retried(self):
-        """No network at logon: shut the attempt down and try again (F-042)."""
+        """No network at logon: shut the attempt down and try again."""
         from telegram.error import NetworkError
 
         from clr import bots
@@ -362,11 +534,73 @@ class TelegramLifecycleTest(unittest.TestCase):
         self.assertEqual(offline.calls, ["initialize", "shutdown"])
         self.assertIn("start_polling", online.calls)
 
+    def test_a_rejected_token_is_a_config_error_without_the_token(self):
+        """The library quotes the token in its message, which would reach the log."""
+        from telegram.error import InvalidToken
+
+        app = FakeApp()
+
+        async def rejected(*args, **kwargs):
+            raise InvalidToken("The token `123456:sekrit-7f3a` was rejected by the server.")
+
+        app.initialize = rejected
+        with mock.patch.object(telegram_bot, "build_application", return_value=app):
+            with self.assertRaises(ConfigError) as ctx:
+                asyncio.run(cli._run_telegram(Config()))
+        self.assertIn("rejected the bot token", str(ctx.exception))
+        self.assertNotIn("sekrit-7f3a", str(ctx.exception))
+        # Nor in a traceback that chains the original exception.
+        self.assertTrue(ctx.exception.__suppress_context__)
+        self.assertIn("shutdown", app.calls)
+
+    def polling_failures(self, spacing, count):
+        """Feed `count` failures, `spacing` seconds apart, to the polling error callback."""
+        from telegram.error import NetworkError
+
+        app = FakeApp()
+        callbacks = []
+
+        async def start_polling(**kwargs):
+            callbacks.append(kwargs.get("error_callback"))
+
+        app.updater.start_polling = start_polling
+
+        async def run():
+            task = asyncio.create_task(cli._run_telegram(Config()))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        with mock.patch.object(telegram_bot, "build_application", return_value=app):
+            asyncio.run(run())
+        on_error = callbacks[0]
+        self.assertIsNotNone(on_error, "start_polling got no error_callback")
+
+        clock = [1_000_000.0]
+        with mock.patch.object(logs.time, "time", lambda: clock[0]), \
+             self.assertLogs("clr.telegram", level="WARNING") as cm:
+            for _ in range(count):
+                on_error(NetworkError("httpx.ReadError: connection lost"))
+                clock[0] += spacing
+        return cm.records
+
+    def test_polling_failures_minutes_apart_are_separate_outages(self):
+        """Polling worked in between, so this is never "still down"."""
+        records = self.polling_failures(spacing=4 * 60, count=5)
+        self.assertEqual({r.levelname for r in records}, {"WARNING"})
+        self.assertTrue(all("attempt 1," in r.getMessage() for r in records), records)
+
+    def test_a_continuous_polling_outage_is_still_escalated(self):
+        records = self.polling_failures(spacing=30, count=31)  # 15 minutes of retries
+        self.assertEqual([r.levelname for r in records].count("ERROR"), 1)
+        self.assertIn("still down after 15m", records[-1].getMessage())
+
 
 @unittest.skipIf(telegram_bot is None, "python-telegram-bot is not installed")
 class TelegramEditedMessageTest(unittest.IsolatedAsyncioTestCase):
     async def test_edited_command_still_gets_a_reply(self):
-        """An edited "/usage" has update.message None (F-011)."""
+        """An edited "/usage" has update.message None."""
         replies = []
 
         async def reply_text(text, **kwargs):
@@ -389,7 +623,7 @@ class TelegramEditedMessageTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies, ["report"])
 
     async def test_stranger_gets_silence_and_is_logged(self):
-        """Unlisted users get no reply and no typing indicator (F-049)."""
+        """Unlisted users get no reply and no typing indicator."""
         replies, actions = [], []
 
         async def reply_text(text, **kwargs):

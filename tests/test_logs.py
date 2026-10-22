@@ -68,7 +68,7 @@ class DailyLogTest(unittest.TestCase):
 
 
     def test_a_deleted_directory_is_recreated_at_rollover(self):
-        """Removing logs/ while the bot runs must not break logging (F-041)."""
+        """Removing logs/ while the bot runs must not break logging."""
         now = time.time()
         self.handler.emit(self._record("today", now))
         self.handler.close()  # Windows cannot delete an open file
@@ -90,9 +90,23 @@ class DailyLogTest(unittest.TestCase):
                 self.handler.handle(self._record(f"tomorrow {n}", now + 86400))
         self.assertEqual(err.getvalue().count("file logging disabled"), 1, err.getvalue())
 
+    def test_a_failed_day_is_retried_the_next_day(self):
+        """Disabled for the day it failed, not for good."""
+        now = time.time()
+        self.handler.emit(self._record("today", now))
+        self.handler.close()
+        shutil.rmtree(self.dir)
+        self.dir.write_text("a file where the directory was")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.handler.handle(self._record("tomorrow", now + 86400))
+        self.dir.unlink()
+        self.handler.handle(self._record("day after", now + 2 * 86400))
+        day = time.strftime("%Y-%m-%d", time.localtime(now + 2 * 86400))
+        self.assertIn("day after", (self.dir / f"{day}.log").read_text(encoding="utf-8"))
+
 
 class SudoOwnershipTest(unittest.TestCase):
-    """Files made under `sudo ... service install` go back to the user (F-003)."""
+    """Files made under `sudo ... service install` go back to the user."""
 
     def build(self, directory, euid, env):
         chowned = []
@@ -106,11 +120,12 @@ class SudoOwnershipTest(unittest.TestCase):
 
     def test_new_directory_and_file_are_handed_back(self):
         directory = Path(tempfile.mkdtemp()) / "logs"
-        chowned = self.build(directory, 0, {"SUDO_UID": "1000", "SUDO_GID": "1000"})
+        # Distinct IDs, so swapped chown arguments cannot pass.
+        chowned = self.build(directory, 0, {"SUDO_UID": "1000", "SUDO_GID": "1001"})
         paths = [p for p, _, _ in chowned]
         self.assertIn(directory, paths)
         self.assertEqual(len([p for p in paths if p.suffix == ".log"]), 1)
-        self.assertTrue(all((u, g) == (1000, 1000) for _, u, g in chowned))
+        self.assertTrue(all((u, g) == (1000, 1001) for _, u, g in chowned))
 
     def test_nothing_changes_without_sudo(self):
         directory = Path(tempfile.mkdtemp()) / "logs"

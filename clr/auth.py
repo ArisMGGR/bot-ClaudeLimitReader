@@ -126,7 +126,7 @@ def _post(url: str, payload: dict, timeout: int = 30) -> tuple[int, dict]:
         try:
             raw = e.read()
         except (OSError, http.client.HTTPException) as read_error:
-            # An error status whose body is cut off is still that status (F-060).
+            # An error status whose body is cut off is still that status.
             return e.code, {
                 "error": "http_error",
                 "error_description": f"the body could not be read: {read_error}",
@@ -148,9 +148,17 @@ _token_lock = threading.RLock()
 
 
 def save_tokens(tokens: Tokens) -> None:
-    ensure_app_dir()
-    with _token_lock:
-        write_private(TOKEN_PATH, json.dumps(tokens.to_dict(), indent=2).encode())
+    try:
+        ensure_app_dir()
+        with _token_lock:
+            write_private(TOKEN_PATH, json.dumps(tokens.to_dict(), indent=2).encode())
+    except OSError as e:
+        # The new tokens are lost, and after a refresh the stored refresh token
+        # is already spent: once the folder is writable, only a login helps.
+        raise AuthError(
+            f"cannot write {TOKEN_PATH}: {e}; make {TOKEN_PATH.parent} writable, "
+            "then run `python run.py login` again"
+        ) from e
 
 
 def load_tokens() -> Tokens | None:

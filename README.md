@@ -1,5 +1,29 @@
 # ClaudeLimitReader
 
+**Set up and install** (guided: venv, login, bot tokens, config, then offers to install the service):
+
+```bash
+python3 run.py setup
+```
+
+**Uninstall the service** (stops the bot and removes the service). A
+system-wide unit, which setup installs when you say yes to "Install
+system-wide?":
+
+```bash
+sudo python3 run.py service uninstall --system
+```
+
+A per-user unit, which `python run.py service install` installs by default:
+
+```bash
+python3 run.py service uninstall
+```
+
+On Windows, run `python run.py service uninstall` instead, from an elevated
+terminal if the service was installed from one. See
+[Running as a service](#running-as-a-service) for details.
+
 A Discord and Telegram bot that reports how much of your Claude subscription
 quota is left, and warns when you are burning it faster than the week can
 absorb.
@@ -177,7 +201,9 @@ guild_id = your-server-id
 
 Setting `guild_id` registers `/usage` in that one server, which takes effect as
 soon as the bot starts. Leaving it out registers globally, which can take up to
-an hour to appear.
+an hour to appear. If the commands cannot be registered in that server (the bot
+is not in it, or the ID is wrong), the bot keeps running and logs an `ERROR`
+naming the `guild_id`; fix it and restart.
 
 **9. Start it.** `python run.py run`. The bot shows as online and `/usage` is
 available immediately.
@@ -242,9 +268,17 @@ file by itself at local midnight. Console output is unchanged; `-v` raises both
 to debug level. If the directory cannot be written, the command warns once and
 carries on without file logging.
 
-While `python run.py run` is up, it also writes an `All good — no errors in the
-last 30 minutes.` line every 30 minutes that passed without an error, so a
-quiet log still shows the bot was alive. A window with an error gets no such line.
+While `python run.py run` is up, it also writes an `All good — no warnings or
+errors in the last 30 minutes.` line every 30 minutes that passed without a
+problem, so a quiet log still shows the bot was alive. A window with a warning
+or an error gets no such line.
+
+A dropped network connection (no DNS, network unreachable) is logged as one
+`WARNING` line per reconnect attempt with its cause, not as a traceback. Once
+the Discord gateway is back, one `INFO` line gives the outage length and the
+number of failed attempts. An outage still going after 15 minutes is logged
+once as an `ERROR`. Telegram polling failures get the same one-line treatment.
+To find outages, run `grep -E "WARNING|ERROR" logs/*.log`.
 
 ## Commands
 
@@ -317,6 +351,9 @@ python run.py service uninstall
 sudo -E venv/bin/python run.py service install --system
 ```
 
+The two are alternatives: `install` refuses while a unit is installed in the
+other scope, since both would run a bot, and names the command that removes it.
+
 A system unit is managed without `--user`:
 
 ```bash
@@ -326,6 +363,9 @@ systemctl status claude-limit-reader-bot.service
 The unit restarts on failure and is confined: `NoNewPrivileges`, `PrivateTmp`,
 `ProtectSystem=strict`, with `ReadWritePaths` limited to the app directory
 (`~/.claudelimitreader`, or `CLR_HOME`) and the project's `logs/` folder.
+If `logs/` is deleted, the unit still starts but logs to the journal only,
+until the folder is back (any `python run.py` command recreates it) and the
+unit restarts.
 `python run.py service show` prints it if you would rather install it yourself.
 
 A service does not inherit your shell's environment, so `install` carries over
@@ -335,6 +375,10 @@ unit as `Environment=` lines, and `CLR_DISCORD_TOKEN` / `CLR_TELEGRAM_TOKEN` go
 into `service.env` in the app directory, written `0600` and referenced with
 `EnvironmentFile=` — the unit file itself is world-readable. Re-run
 `service install` after changing any of them; it restarts the running bot.
+`uninstall`, and an `install` from another `CLR_HOME`, delete the
+`service.env` the installed unit names, wherever it is. A file the unit names
+that `install` did not write (one you pointed a hand-installed unit at) is
+left alone.
 
 ### Windows
 
@@ -344,7 +388,8 @@ name, `claude-limit-reader-bot`:
 - **Elevated** — a Task Scheduler task triggered at logon. Creating a
   logon-triggered task requires Administrator, so run it from an elevated
   terminal to get this. The task runs a `claude-limit-reader-bot.cmd` launcher
-  kept in the app directory, so a console window flashes briefly at logon.
+  kept in `%LOCALAPPDATA%\claude-limit-reader-bot`, so a console window
+  flashes briefly at logon.
 - **Not elevated** — a `claude-limit-reader-bot.cmd` launcher in your Startup
   folder, which needs no privileges and starts at the same point.
 
@@ -357,7 +402,9 @@ Either way the bot runs under `pythonw.exe`, so it has no console window, and
 The launcher sets `CLR_HOME`, `CLR_CONFIG` (or the `-c` path) and any
 `CLR_*_TOKEN` from the installing shell, since a logon task does not inherit
 it; re-run `service install` after changing them, which stops the running bot
-and starts a new one. With no console, a bot that
+and starts a new one. The launcher and the running bot's record live outside
+`CLR_HOME`, so `service status` and `uninstall` find them from any shell.
+With no console, a bot that
 fails to start says why in the day's file under `logs/`.
 
 Windows has no equivalent of the unit's `Restart=on-failure`: if the bot exits,

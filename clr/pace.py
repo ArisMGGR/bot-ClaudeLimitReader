@@ -132,7 +132,7 @@ def analyze(
         seconds_to_full = 100.0 / rate_per_second
         try:
             exhausts_at = start + dt.timedelta(seconds=seconds_to_full)
-        except OverflowError:  # so slow a rate that 100% lies past year 9999 (F-064)
+        except OverflowError:  # so slow a rate that 100% lies past year 9999
             exhausts_at = None
 
     margin = used - elapsed_pct

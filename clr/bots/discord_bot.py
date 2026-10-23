@@ -17,7 +17,8 @@ from ..auth import (
     save_tokens,
     start_login,
 )
-from ..config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config
+from ..config import DEFAULT_CONFIG_PATH, TOKEN_PATH, Config, ConfigError
+from ..logs import Outage
 from ..pace import humanize
 from ..render import (
     _severity_icon,
@@ -56,12 +57,35 @@ def build_embed(cfg: Config) -> discord.Embed:
     return embed
 
 
+class _ReconnectFilter(logging.Filter):
+    """Swaps discord.py's per-retry traceback for the outage's one-liner.
+
+    ``Client.connect`` logs every failed gateway reconnect with
+    ``log.exception("Attempting a reconnect in %.2fs")``: some 60 lines of
+    aiohttp/asyncio frames per attempt, a dozen attempts for a short network
+    drop. The cause and the retry delay are all that line carries.
+    """
+
+    def __init__(self, outage: Outage) -> None:
+        super().__init__()
+        self.outage = outage
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if exc is None or not str(record.msg).startswith("Attempting a reconnect"):
+            return True
+        retry = record.args[0] if isinstance(record.args, tuple) and record.args else None
+        self.outage.failed(exc, retry_in=retry, now=record.created)
+        return False
+
+
 class UsageClient(discord.Client):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, outage: Outage | None = None):
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
         self.started_at = dt.datetime.now(dt.timezone.utc)  # for /status
+        self.outage = outage or Outage(log, "Discord gateway")
 
     async def setup_hook(self) -> None:
         self.tree.add_command(_make_usage_command(self.cfg))
@@ -73,14 +97,33 @@ class UsageClient(discord.Client):
             # Guild-scoped commands appear at once; global ones can take ~1h.
             guild = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.DiscordServerError:
+                raise  # transient; retry_startup tries again
+            except discord.HTTPException as e:
+                # A server the bot is not in (403) or no such server (404) is a
+                # config mistake: say so and stay up, rather than end the bot
+                # and the Telegram one beside it.
+                log.error(
+                    "could not register slash commands in guild %s (%s); check "
+                    "discord.guild_id and that the bot was invited to that server "
+                    "with the applications.commands scope, then restart",
+                    guild_id, e,
+                )
+                return
             log.info("slash commands synced to guild %s", guild_id)
         else:
             await self.tree.sync()
             log.info("slash commands synced globally (may take up to an hour)")
 
     async def on_ready(self) -> None:
+        self.outage.restored()
         log.info("connected as %s", self.user)
+
+    async def on_resumed(self) -> None:
+        # A successful RESUME after a drop fires this instead of on_ready.
+        self.outage.restored()
 
 
 def _make_usage_command(cfg: Config) -> app_commands.Command:
@@ -212,21 +255,22 @@ def _make_status_command(cfg: Config) -> app_commands.Command:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            embed = build_status_embed(cfg, interaction.client)
+            # Off the event loop: load_tokens waits on the token lock, which a
+            # refresh holds for as long as the token endpoint takes to answer.
+            embed = await asyncio.to_thread(build_status_embed, cfg, interaction.client)
         except AuthError as e:
-            await interaction.response.send_message(
-                f"⚠️ Auth problem\n```{e}```", ephemeral=True
-            )
+            await interaction.followup.send(f"⚠️ Auth problem\n```{e}```", ephemeral=True)
             return
         except Exception:
             log.exception("unexpected failure building status embed")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ Unexpected error — check the bot logs.", ephemeral=True
             )
             return
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     return status
 
@@ -348,9 +392,11 @@ def _make_authenticate_command(cfg: Config) -> app_commands.Command:
 
 
 async def run(cfg: Config) -> None:
+    outage = Outage(log, "Discord gateway")
+
     async def login() -> UsageClient:
         # A fresh client per attempt; login() also runs setup_hook's sync.
-        client = UsageClient(cfg)
+        client = UsageClient(cfg, outage)
         try:
             await client.login(cfg.discord.token)
         except BaseException:
@@ -360,10 +406,21 @@ async def run(cfg: Config) -> None:
 
     # OSError covers aiohttp's connection errors. connect() then handles its
     # own reconnects; a bad token (LoginFailure) is not retried.
-    client = await retry_startup(
-        "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
-    )
+    try:
+        client = await retry_startup(
+            "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
+        )
+    except discord.LoginFailure:
+        # An "Error:" line like Telegram's rejected token, not a traceback.
+        raise ConfigError(
+            "Discord rejected the bot token; check discord.token (or "
+            "CLR_DISCORD_TOKEN), and reset it on the Developer Portal's Bot tab if it was revoked"
+        ) from None
+    reconnects = _ReconnectFilter(outage)
+    client_log = logging.getLogger("discord.client")
+    client_log.addFilter(reconnects)
     try:
         await client.connect(reconnect=True)
     finally:
+        client_log.removeFilter(reconnects)
         await client.close()

@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,7 +58,9 @@ class RenderUnitTest(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", unit)
         paths = directive(unit, "ReadWritePaths")
         self.assertIn([str(service.APP_DIR)], paths)
-        self.assertIn([str(service.LOG_DIR)], paths)
+        # '-' makes a missing logs/ skipped instead of failing the start;
+        # the app dir stays required, since the bot cannot run without it.
+        self.assertIn(["-" + str(service.LOG_DIR)], paths)
 
     def test_custom_config_path_is_passed_through(self):
         other = Path("/srv/clr/other.toml")
@@ -76,7 +79,7 @@ class RenderUnitTest(unittest.TestCase):
 
 
 class EnvironmentCarryOverTest(unittest.TestCase):
-    """What the installing shell sets must reach the service (F-001)."""
+    """What the installing shell sets must reach the service."""
 
     def render(self, env, **kwargs):
         with mock.patch.dict(os.environ, {**NO_CLR_ENV, **env}, clear=True):
@@ -106,6 +109,13 @@ class EnvironmentCarryOverTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLR_TELEGRAM_TOKEN": "123:abc$x"}):
             self.assertIn("CLR_TELEGRAM_TOKEN='123:abc$x'\n", service.render_service_env())
 
+    def test_tokens_are_carried_without_surrounding_whitespace(self):
+        """As the loader reads them: stripped, and a blank one counts as unset."""
+        env = {**NO_CLR_ENV, "CLR_TELEGRAM_TOKEN": "123:abc\r", "CLR_DISCORD_TOKEN": "  "}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(service.token_environment(), {"CLR_TELEGRAM_TOKEN": "123:abc"})
+            self.assertEqual(service.render_service_env(), "CLR_TELEGRAM_TOKEN='123:abc'\n")
+
     def test_a_token_that_cannot_be_stored_is_refused(self):
         with mock.patch.dict(os.environ, {"CLR_DISCORD_TOKEN": "it's"}):
             with self.assertRaises(service.ServiceError):
@@ -120,6 +130,7 @@ class InstallSystemdTest(unittest.TestCase):
             ("LOG_DIR", self.dir / "logs"),
             ("SERVICE_ENV", self.dir / "app" / "service.env"),
             ("USER_UNIT_DIR", self.dir / "units"),
+            ("SYSTEM_UNIT_DIR", self.dir / "system"),
         ):
             patcher = mock.patch.object(service, name, value)
             patcher.start()
@@ -146,20 +157,113 @@ class InstallSystemdTest(unittest.TestCase):
         self.install({})
         self.assertFalse((self.dir / "app" / "service.env").exists())
 
+    def elsewhere(self):
+        """As a shell whose CLR_HOME is not the one the unit was installed from."""
+        other = self.dir / "other"
+        return mock.patch.multiple(service, APP_DIR=other, SERVICE_ENV=other / "service.env")
+
+    def test_uninstall_removes_the_tokens_the_unit_names(self):
+        self.install({"CLR_DISCORD_TOKEN": "discord-secret"})
+        installed = self.dir / "app" / "service.env"
+        self.assertTrue(installed.exists())
+        with self.elsewhere(), mock.patch.dict(os.environ, NO_CLR_ENV, clear=True):
+            service._uninstall_systemd(system_scope=False)
+        self.assertFalse(installed.exists())
+
+    def test_a_reinstall_from_another_app_dir_removes_the_old_tokens(self):
+        self.install({"CLR_DISCORD_TOKEN": "discord-secret"})
+        with self.elsewhere():
+            self.install({"CLR_DISCORD_TOKEN": "discord-secret"})
+        self.assertFalse((self.dir / "app" / "service.env").exists())
+        self.assertIn("discord-secret",
+                      (self.dir / "other" / "service.env").read_text(encoding="utf-8"))
+
+    def hand_installed(self, name, text):
+        """A unit set up by hand from `service show`, naming an env file of the user's."""
+        own = self.dir / "mine" / name
+        own.parent.mkdir()
+        own.write_text(text, encoding="utf-8")
+        unit = service.unit_path(False)
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(f"[Service]\nEnvironmentFile=-{own}\n", encoding="utf-8")
+        return own
+
+    def test_a_users_own_environment_file_is_never_deleted(self):
+        """Only a service.env holding just the CLR_*_TOKEN lines install writes."""
+        for name, text in (
+            ("my-secrets.env", "CLR_DISCORD_TOKEN='x'\n"),
+            ("service.env", "CLR_DISCORD_TOKEN='x'\nOTHER_APP_KEY=keep-me\n"),
+        ):
+            for action in ("uninstall", "install"):
+                with self.subTest(name=name, action=action):
+                    own = self.hand_installed(name, text)
+                    if action == "uninstall":
+                        with mock.patch.dict(os.environ, NO_CLR_ENV, clear=True):
+                            service._uninstall_systemd(system_scope=False)
+                    else:
+                        self.install({"CLR_DISCORD_TOKEN": "discord-secret"})
+                    self.assertEqual(own.read_text(encoding="utf-8"), text)
+                    service.unit_path(False).unlink(missing_ok=True)
+                    shutil.rmtree(own.parent)
+
     def test_missing_log_dir_is_created(self):
         self.install({})
         self.assertTrue((self.dir / "logs").is_dir())
 
     def test_install_restarts_a_running_unit(self):
-        """`enable --now` leaves a running unit on its old settings (F-029)."""
+        """`enable --now` leaves a running unit on its old settings."""
         self.install({})
         calls = [c.args[1:] for c in service._systemctl.call_args_list]
         self.assertIn(("restart", service.SERVICE_NAME), calls)
         self.assertNotIn("--now", [word for call in calls for word in call])
 
+    def other_scope_refuses(self, existing_scope, euid=1000):
+        """Install into the scope other than `existing_scope`; return the refusal."""
+        existing = service.unit_path(existing_scope)
+        existing.parent.mkdir(parents=True)
+        existing.write_text("[Unit]\n", encoding="utf-8")
+        with mock.patch.object(service.os, "geteuid", lambda: euid, create=True), \
+             mock.patch.dict(os.environ, NO_CLR_ENV, clear=True), \
+             self.assertRaises(service.ServiceError) as ctx:
+            service._install_systemd(system_scope=not existing_scope, config_path=None)
+        self.assertFalse(service.unit_path(not existing_scope).exists())
+        service._systemctl.assert_not_called()
+        return str(ctx.exception)
+
+    def test_a_user_unit_is_refused_beside_a_system_unit(self):
+        """Side by side, both units would run a bot."""
+        error = self.other_scope_refuses(existing_scope=True)
+        self.assertIn(str(service.unit_path(True)), error)
+        self.assertIn("--system", error)
+
+    def test_a_system_unit_is_refused_beside_a_user_unit(self):
+        error = self.other_scope_refuses(existing_scope=False, euid=0)
+        self.assertIn(str(service.unit_path(False)), error)
+        self.assertIn("service uninstall", error)
+
+    def test_under_sudo_the_sudo_users_unit_is_found(self):
+        """HOME can be root's under sudo; the user unit is SUDO_USER's."""
+        alice = self.dir / "alice"
+        unit = alice / service.USER_UNIT_SUBDIR / service.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Unit]\n", encoding="utf-8")
+        with mock.patch.object(service.os, "geteuid", lambda: 0, create=True), \
+             mock.patch.object(service, "_home_of", lambda user: alice), \
+             mock.patch.dict(os.environ, {**NO_CLR_ENV, "SUDO_USER": "alice"}, clear=True), \
+             self.assertRaises(service.ServiceError) as ctx:
+            service._install_systemd(system_scope=True, config_path=None)
+        self.assertIn(str(unit), str(ctx.exception))
+
+    def test_status_names_a_unit_in_the_other_scope(self):
+        for scope in (True, False):
+            service.unit_path(scope).parent.mkdir(parents=True, exist_ok=True)
+            service.unit_path(scope).write_text("[Unit]\n", encoding="utf-8")
+        self.assertIn(str(service.unit_path(True)), service._status_systemd(False))
+        self.assertIn("drop --system", service._status_systemd(True))
+
 
 class SudoAppDirTest(unittest.TestCase):
-    """Under sudo, the unit uses SUDO_USER's app directory, not root's (F-030)."""
+    """Under sudo, the unit uses SUDO_USER's app directory, not root's."""
 
     def render(self, env):
         home = Path("/home/alice")
@@ -185,7 +289,7 @@ class SudoAppDirTest(unittest.TestCase):
 
 
 class UnitQuotingTest(unittest.TestCase):
-    """Paths reach systemd as one word each, whatever they contain (F-002)."""
+    """Paths reach systemd as one word each, whatever they contain."""
 
     def setUp(self):
         patcher = mock.patch.dict(os.environ, NO_CLR_ENV, clear=True)
@@ -208,7 +312,7 @@ class UnitQuotingTest(unittest.TestCase):
         self.assertEqual(directive(unit, "ExecStart"), [["/usr/bin/python3", str(run_py), "run"]])
 
     def test_dollar_is_escaped_only_where_systemd_expands_it(self):
-        """ExecStart= substitutes $VAR; ReadWritePaths= and Environment= do not (F-046)."""
+        """ExecStart= substitutes $VAR; ReadWritePaths= and Environment= do not."""
         run_py, app = Path("/opt/a$USER/run.py"), Path("/home/u/a$HOME")
         with mock.patch.object(
             service, "entry_point", return_value=("/usr/bin/python3", run_py)
@@ -228,7 +332,8 @@ class UnitQuotingTest(unittest.TestCase):
              mock.patch.object(service, "LOG_DIR", logs), \
              mock.patch.dict(os.environ, {"CLR_HOME": str(app)}):
             unit = service.render_unit()
-        self.assertEqual(directive(unit, "ReadWritePaths"), [[str(app.absolute())], [str(logs)]])
+        self.assertEqual(directive(unit, "ReadWritePaths"),
+                         [[str(app.absolute())], ["-" + str(logs)]])
         self.assertIn([f"CLR_HOME={app.absolute()}"], directive(unit, "Environment"))
 
 
@@ -262,9 +367,16 @@ class WindowsLauncherTest(unittest.TestCase):
         self.assertIn('set "CLR_DISCORD_TOKEN=tok"', body)
 
     def test_show_hides_tokens(self):
-        body = self.body({"CLR_DISCORD_TOKEN": "sekrit-7f3a"}, reveal_tokens=False)
-        self.assertNotIn("sekrit-7f3a", "\n".join(body))
-        self.assertIn('set "CLR_DISCORD_TOKEN=<your CLR_DISCORD_TOKEN>"', body)
+        """`service show` itself, in both install modes, never prints a token."""
+        env = {**NO_CLR_ENV, "CLR_DISCORD_TOKEN": "sekrit-7f3a"}
+        for elevated in (True, False):
+            with self.subTest(elevated=elevated), \
+                 mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(service.sys, "platform", "win32"), \
+                 mock.patch.object(service, "_is_admin", return_value=elevated):
+                shown = service.show()
+            self.assertNotIn("sekrit-7f3a", shown)
+            self.assertIn('set "CLR_DISCORD_TOKEN=<your CLR_DISCORD_TOKEN>"', shown)
 
     def test_percent_is_doubled(self):
         with mock.patch.object(service, "task_command", return_value='"C:\\100%\\py" run'):
@@ -291,13 +403,16 @@ class WindowsLauncherTest(unittest.TestCase):
             service._write_launcher(launcher, None, "test")
         text = launcher.read_text(encoding="utf-8").replace('start "" ', "")
         launcher.write_text(text, encoding="utf-8")
-        subprocess.run(["cmd", "/c", str(launcher)], capture_output=True, timeout=60)
+        # A console of its own, as at logon: in this test's console, chcp would
+        # outlive the run and let a later launcher without it pass.
+        subprocess.run(["cmd", "/c", str(launcher)], capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
         self.assertTrue(marker.exists(), "the launcher did not run the script")
         self.assertEqual(marker.read_text(encoding="utf-8"), str(root.absolute()))
 
 
 class TaskActionTest(unittest.TestCase):
-    """The scheduled task's command line reaches the launcher from any path (F-052)."""
+    """The scheduled task's command line reaches the launcher from any path."""
 
     @unittest.skipUnless(sys.platform == "win32", "runs cmd.exe")
     def test_launcher_runs_from_paths_with_cmd_metacharacters(self):
@@ -317,7 +432,7 @@ class TaskActionTest(unittest.TestCase):
 
 
 class WindowsReinstallTest(unittest.TestCase):
-    """A re-install replaces the running bot instead of adding a second (F-029)."""
+    """A re-install replaces the running bot instead of adding a second."""
 
     def test_running_instance_is_stopped_before_the_new_one_starts(self):
         order = []
@@ -333,7 +448,7 @@ class WindowsReinstallTest(unittest.TestCase):
         self.assertIn("already running", note)
 
     def test_elevated_reinstall_stops_the_old_bot_before_the_task_runs(self):
-        """The elevated path starts the bot with `schtasks /Run`, not a spawn (F-062)."""
+        """The elevated path starts the bot with `schtasks /Run`, not a spawn."""
         order = []
 
         def run(cmd):
@@ -351,6 +466,20 @@ class WindowsReinstallTest(unittest.TestCase):
             note = service._install_windows(None)
         self.assertEqual(order, ["stop", "/Create", "/Run"])
         self.assertIn("already running", note)
+
+    def test_install_time_bot_gets_the_launchers_clr_config(self):
+        """Not this shell's CLR_CONFIG, which the logon launcher would not set."""
+        env = {**NO_CLR_ENV, "CLR_HOME": str(service.APP_DIR), "CLR_CONFIG": "~nosuchuser/c.toml"}
+        for config_path, expected in (
+            (service.APP_DIR / "config.toml", None),
+            (Path("/srv/clr/other.toml"), str(Path("/srv/clr/other.toml").absolute())),
+        ):
+            with self.subTest(config=str(config_path)), \
+                 mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(service.subprocess, "Popen") as popen, \
+                 mock.patch.object(service, "_write_pid_file"):
+                service._spawn_detached(config_path)
+            self.assertEqual(popen.call_args.kwargs["env"].get("CLR_CONFIG"), expected)
 
     def test_launcher_marks_the_bot_as_the_service(self):
         with mock.patch.dict(os.environ, NO_CLR_ENV, clear=True):
@@ -372,7 +501,7 @@ class WindowsReinstallTest(unittest.TestCase):
 
 
 class WindowsModeSwitchTest(unittest.TestCase):
-    """The Startup launcher and the scheduled task never coexist (F-040)."""
+    """The Startup launcher and the scheduled task never coexist."""
 
     def setUp(self):
         root = Path(tempfile.mkdtemp())
@@ -416,8 +545,40 @@ class WindowsModeSwitchTest(unittest.TestCase):
         self.assertFalse(service.STARTUP_SCRIPT.exists())
 
 
+class WindowsStatePathTest(unittest.TestCase):
+    """uninstall and status work from a shell without the install's CLR_HOME."""
+
+    def test_launcher_and_pid_file_do_not_follow_clr_home(self):
+        project = Path(__file__).resolve().parent.parent
+        code = "from clr import service; print(service.TASK_LAUNCHER); print(service.PID_FILE)"
+        seen = []
+        for name in ("one", "two"):
+            env = {**NO_CLR_ENV, "CLR_HOME": str(Path(tempfile.mkdtemp()) / name)}
+            out = subprocess.run([sys.executable, "-B", "-c", code], cwd=project, env=env,
+                                 capture_output=True, text=True, check=True)
+            seen.append(out.stdout)
+        self.assertEqual(seen[0], seen[1])
+
+    def test_uninstall_removes_this_and_the_earlier_launcher_location(self):
+        """Both hold the tokens; earlier versions kept the launcher in the app dir."""
+        root = Path(tempfile.mkdtemp())
+        launcher, legacy = root / "state" / "bot.cmd", root / "app" / "bot.cmd"
+        for path in (launcher, legacy):
+            path.parent.mkdir()
+            path.write_text('set "CLR_DISCORD_TOKEN=x"', encoding="utf-8")
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.multiple(service, TASK_LAUNCHER=launcher, LEGACY_TASK_LAUNCHER=legacy,
+                                 STARTUP_SCRIPT=root / "Startup" / "bot.cmd",
+                                 PID_FILE=root / "state" / "service.pid"), \
+             mock.patch.object(service, "_run", return_value=ok):
+            note = service._uninstall_windows()
+        self.assertFalse(launcher.exists())
+        self.assertFalse(legacy.exists())
+        self.assertIn(str(legacy), note)
+
+
 class WindowsStatusTest(unittest.TestCase):
-    """Both install modes say whether the bot runs and where it logs (F-054)."""
+    """Both install modes say whether the bot runs and where it logs."""
 
     TASK = ("TaskName: \\claude-limit-reader-bot\nNext Run Time: N/A\nStatus: Ready\n"
             "Last Run Time: N/A\nLast Result: 0\n")
@@ -452,7 +613,7 @@ class WindowsStatusTest(unittest.TestCase):
 
 class ShowOutputTest(unittest.TestCase):
     def test_printed_schtasks_command_quotes_the_action(self):
-        """Pasted as printed, /TR must stay one argument (F-035)."""
+        """Pasted as printed, /TR must stay one argument."""
         with mock.patch.dict(os.environ, NO_CLR_ENV, clear=True), \
              mock.patch.object(service.sys, "platform", "win32"), \
              mock.patch.object(service, "_is_admin", return_value=True):
@@ -461,7 +622,7 @@ class ShowOutputTest(unittest.TestCase):
         self.assertIn('/TR "cmd.exe /s /c \\"\\"', line)
 
     def test_systemd_show_includes_the_environment_file(self):
-        """The unit reads service.env, so show prints it, token hidden (F-036)."""
+        """The unit reads service.env, so show prints it, token hidden."""
         env = {**NO_CLR_ENV, "CLR_DISCORD_TOKEN": "sekrit-7f3a"}
         with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(service.sys, "platform", "linux"):
@@ -472,7 +633,7 @@ class ShowOutputTest(unittest.TestCase):
 
 
 class ShowMatchesInstallTest(unittest.TestCase):
-    """`service show` prints what `install` writes (F-018)."""
+    """`service show` prints what `install` writes."""
 
     def test_system_unit_names_the_sudo_user(self):
         env = {**NO_CLR_ENV, "SUDO_USER": "alice"}
@@ -494,7 +655,7 @@ class ShowMatchesInstallTest(unittest.TestCase):
 
 
 class PidFileTest(unittest.TestCase):
-    """A recycled PID must never be killed (F-004)."""
+    """A recycled PID must never be killed."""
 
     def setUp(self):
         self.pid_file = Path(tempfile.mkdtemp()) / "service.pid"
@@ -590,6 +751,15 @@ class BackendTest(unittest.TestCase):
             with self.assertRaises(service.ServiceError) as ctx:
                 service.install()
         self.assertIn("run.py run", str(ctx.exception))
+
+    def test_uninstall_without_a_manager_says_the_same(self):
+        """uninstall names what is missing, as install does."""
+        with mock.patch.object(service, "backend", return_value=""):
+            with self.assertRaises(service.ServiceError) as uninstall:
+                service.uninstall()
+            with self.assertRaises(service.ServiceError) as install:
+                service.install()
+        self.assertEqual(str(uninstall.exception), str(install.exception))
 
 
 if __name__ == "__main__":

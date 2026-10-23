@@ -1,16 +1,38 @@
+# Python
 __pycache__/
 *.py[cod]
+
+# Virtual environments (setup creates ./venv)
 .venv/
 venv/
+
+# Secrets and local config (tokens live here)
 config.toml
-config.toml.bak
-*.tmp
 tokens.json
 service.env
+.env
+*.env
+!.env.example
+
+# Backups and temp files (config backups hold old tokens)
+*.bak
+*.tmp
+
+# Service artifacts
 claude-limit-reader-bot.cmd
+service.pid
+
+# Logs
 *.log
 logs/
-service.pid
+
+# Local audit notes
 tests/FINDINGS.md
 tests/VERIFY.md
 tests/LOG.md
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

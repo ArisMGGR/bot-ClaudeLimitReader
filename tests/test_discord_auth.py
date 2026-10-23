@@ -4,8 +4,12 @@ These drive the command callbacks against stub interactions; nothing here
 connects to Discord.
 """
 
+import asyncio
 import datetime as dt
+import logging
+import socket
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,7 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clr.auth import AuthError, Tokens  # noqa: E402
-from clr.config import Config, DiscordConfig, TelegramConfig  # noqa: E402
+from clr.config import Config, ConfigError, DiscordConfig, TelegramConfig  # noqa: E402
 
 try:
     from clr.bots import discord_bot
@@ -36,6 +40,9 @@ class StubResponse:
         self.messages = []
         self.modals = []
         self.deferred = False
+        # A deferred reply's visibility is set here, not by the followup's own
+        # ephemeral flag, so tests of privacy must look at these.
+        self.defer_kwargs = None
 
     async def send_message(self, content=None, **kwargs):
         self.messages.append((content, kwargs))
@@ -45,6 +52,7 @@ class StubResponse:
 
     async def defer(self, **kwargs):
         self.deferred = True
+        self.defer_kwargs = kwargs
 
 
 class StubFollowup:
@@ -108,7 +116,7 @@ class AuthenticateCommandTest(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipIf(discord_bot is None, "discord.py is not installed")
 class UsageCommandTest(unittest.IsolatedAsyncioTestCase):
-    """Only allowed_user_ids see the quota report (F-050)."""
+    """Only allowed_user_ids see the quota report."""
 
     async def invoke(self, user_id):
         command = discord_bot._make_usage_command(cfg())
@@ -131,6 +139,7 @@ class UsageCommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_owner_gets_the_report_privately(self):
         interaction, build = await self.invoke(OWNER)
         build.assert_called_once()
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
         content, kwargs = interaction.followup.messages[0]
         self.assertEqual(kwargs["embed"], "embed")
         self.assertTrue(kwargs["ephemeral"])
@@ -156,19 +165,41 @@ class StatusCommandTest(unittest.IsolatedAsyncioTestCase):
             await command.callback(interaction)
         return interaction
 
-    async def test_stranger_is_refused(self):
-        interaction = await self.invoke(STRANGER, stored=tokens())
-        self.assertEqual(interaction.response.messages[0][0], "Not authorized.")
+    async def test_stranger_is_refused_privately_and_logged(self):
+        with self.assertLogs(discord_bot.log, level="WARNING") as logs:
+            interaction = await self.invoke(STRANGER, stored=tokens())
+        content, kwargs = interaction.response.messages[0]
+        self.assertEqual(content, "Not authorized.")
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertFalse(interaction.response.deferred)
+        self.assertTrue(any(str(STRANGER) in line for line in logs.output), logs.output)
 
     async def test_reply_is_ephemeral(self):
         interaction = await self.invoke(OWNER, stored=tokens())
-        self.assertTrue(interaction.response.messages[0][1]["ephemeral"])
+        self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
+        self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
     async def test_logged_out_points_at_authenticate(self):
         interaction = await self.invoke(OWNER, stored=None)
-        embed = interaction.response.messages[0][1]["embed"]
+        embed = interaction.followup.messages[0][1]["embed"]
         self.assertEqual(embed.title, "Not logged in")
         self.assertIn("/authenticate", embed.description)
+
+    async def test_tokens_are_read_off_the_event_loop(self):
+        """A refresh holds the token lock; waiting for it must not stall the bot."""
+        threads = []
+
+        def load_tokens():
+            threads.append(threading.get_ident())
+            return tokens()
+
+        command = discord_bot._make_status_command(cfg())
+        interaction = StubInteraction(OWNER)
+        interaction.client = StubClient()
+        with mock.patch.object(discord_bot, "load_tokens", load_tokens):
+            await command.callback(interaction)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
 
 
 @unittest.skipIf(discord_bot is None, "discord.py is not installed")
@@ -258,7 +289,9 @@ class LoginViewTest(unittest.IsolatedAsyncioTestCase):
         view = self.view()
         interaction = StubInteraction(STRANGER)
         await view.enter_code.callback(interaction)
-        self.assertEqual(interaction.response.messages[0][0], "Not authorized.")
+        content, kwargs = interaction.response.messages[0]
+        self.assertEqual(content, "Not authorized.")
+        self.assertTrue(kwargs["ephemeral"])
         self.assertEqual(interaction.response.modals, [])
 
     async def test_requester_gets_the_modal(self):
@@ -323,28 +356,33 @@ class CodeModalTest(unittest.IsolatedAsyncioTestCase):
                 interaction = StubInteraction(OWNER)
                 with patch, mock.patch.object(discord_bot, "save_tokens"):
                     await self.modal(code=code).on_submit(interaction)
+                self.assertTrue(interaction.response.defer_kwargs["ephemeral"])
                 self.assertTrue(interaction.followup.messages[0][1]["ephemeral"])
 
     async def test_the_code_never_reaches_the_log(self):
-        modal = self.modal(code="secret-code#state")
-        interaction = StubInteraction(OWNER)
-        with mock.patch.object(
-            discord_bot, "finish_login", side_effect=AuthError("rejected")
+        """Neither when the code is accepted nor when it is rejected."""
+        for outcome, patch in (
+            ("accepted", mock.patch.object(discord_bot, "finish_login", return_value=tokens())),
+            ("rejected", mock.patch.object(discord_bot, "finish_login",
+                                           side_effect=AuthError("rejected"))),
         ):
-            with mock.patch.object(discord_bot, "save_tokens"):
-                with self.assertLogs(discord_bot.log, level="DEBUG") as logs:
-                    await modal.on_submit(interaction)
-
-        self.assertNotIn("secret-code", "\n".join(logs.output))
+            with self.subTest(outcome):
+                modal = self.modal(code="secret-code#state")
+                interaction = StubInteraction(OWNER)
+                with patch, mock.patch.object(discord_bot, "save_tokens"):
+                    # The root logger: a record on any logger, not just clr.discord.
+                    with self.assertLogs(level="DEBUG") as logs:
+                        await modal.on_submit(interaction)
+                self.assertNotIn("secret-code", "\n".join(logs.output))
 
 
 @unittest.skipIf(discord_bot is None, "discord.py is not installed")
 class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
-    """No network at logon must not end the bot; a bad token still does (F-042)."""
+    """No network at logon must not end the bot; a bad token still does."""
 
     def fake_client(self, outcomes, log):
         class FakeClient:
-            def __init__(self, cfg):
+            def __init__(self, cfg, outage=None):
                 log.append("new")
 
             async def login(self, token):
@@ -372,14 +410,147 @@ class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log, ["new", "close", "new", "connect", "close"])
 
     async def test_a_rejected_token_is_not_retried(self):
+        """It ends the run as a ConfigError (an Error line), not a traceback."""
         import discord
 
         log = []
         fake = self.fake_client([discord.LoginFailure("Improper token")], log)
         with mock.patch.object(discord_bot, "UsageClient", fake):
-            with self.assertRaises(discord.LoginFailure):
+            with self.assertRaises(ConfigError) as ctx:
                 await discord_bot.run(cfg())
         self.assertEqual(log, ["new", "close"])
+        self.assertIn("discord.token", str(ctx.exception))
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    async def test_reconnects_during_connect_are_one_line_warnings(self):
+        """run() itself installs the reconnect filter, and removes it after."""
+        client_log = logging.getLogger("discord.client")
+        filters_before = list(client_log.filters)
+
+        class FakeClient:
+            def __init__(self, cfg, outage=None):
+                pass
+
+            async def login(self, token):
+                pass
+
+            async def connect(self, reconnect=True):
+                # What discord.py's Client.connect logs for each failed reconnect.
+                try:
+                    raise OSError("Cannot connect to host gateway.discord.gg:443")
+                except OSError:
+                    client_log.exception("Attempting a reconnect in %.2fs", 2.5)
+
+            async def close(self):
+                pass
+
+        with mock.patch.object(discord_bot, "UsageClient", FakeClient), \
+             self.assertLogs("clr.discord", level="WARNING") as clr_logs, \
+             self.assertNoLogs("discord.client", level="DEBUG"):
+            await discord_bot.run(cfg())
+        self.assertEqual(len(clr_logs.records), 1)
+        record = clr_logs.records[0]
+        self.assertIn("Discord gateway unreachable", record.getMessage())
+        self.assertIn("retrying in 2s", record.getMessage())
+        self.assertIsNone(record.exc_info)
+        self.assertEqual(client_log.filters, filters_before)
+
+
+@unittest.skipIf(discord_bot is None, "discord.py is not installed")
+class GuildSyncTest(unittest.TestCase):
+    """A wrong guild_id is logged, not fatal; a Discord outage is still retried."""
+
+    def sync_with(self, error, status):
+        conf = cfg()
+        conf.discord.guild_id = 1234
+        client = discord_bot.UsageClient(conf)
+        response = mock.Mock(status=status, reason="")
+        with mock.patch.object(client.tree, "sync",
+                               side_effect=error(response, {"code": 0, "message": "x"})):
+            asyncio.run(client.setup_hook())
+
+    def test_a_guild_the_bot_cannot_reach_is_an_error_line(self):
+        import discord
+
+        for error, status in ((discord.Forbidden, 403), (discord.NotFound, 404)):
+            with self.subTest(status), self.assertLogs(discord_bot.log, level="ERROR") as logs:
+                self.sync_with(error, status)
+            self.assertIn("1234", logs.output[0])
+            self.assertIn("discord.guild_id", logs.output[0])
+
+    def test_a_server_error_still_reaches_the_startup_retry(self):
+        import discord
+
+        with self.assertRaises(discord.DiscordServerError):
+            self.sync_with(discord.DiscordServerError, 503)
+
+
+@unittest.skipIf(discord_bot is None, "discord.py is not installed")
+class ReconnectLogTest(unittest.TestCase):
+    """A gateway reconnect logs one line, not discord.py's traceback."""
+
+    def setUp(self):
+        from clr.logs import Outage
+
+        self.outage = Outage(discord_bot.log, "Discord gateway")
+        self.filter = discord_bot._ReconnectFilter(self.outage)
+        self.client_log = logging.getLogger("discord.client")
+        self.client_log.addFilter(self.filter)
+        self.addCleanup(self.client_log.removeFilter, self.filter)
+        self.old_level = self.client_log.level
+        self.client_log.setLevel(logging.DEBUG)
+        self.addCleanup(self.client_log.setLevel, self.old_level)
+
+    def reconnect(self):
+        try:
+            try:
+                raise socket.gaierror(-3, "Temporary failure in name resolution")
+            except OSError as e:
+                raise OSError(
+                    "Cannot connect to host gateway.discord.gg:443 ssl:default "
+                    "[Temporary failure in name resolution]"
+                ) from e
+        except OSError:
+            self.client_log.exception("Attempting a reconnect in %.2fs", 1.21)
+
+    def test_reconnect_becomes_a_one_line_warning(self):
+        with self.assertLogs("clr.discord", level="DEBUG") as clr_logs, \
+             self.assertNoLogs("discord.client", level="DEBUG"):
+            self.reconnect()
+        self.assertEqual(len(clr_logs.records), 1)
+        record = clr_logs.records[0]
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIsNone(record.exc_info)
+        self.assertIn("name resolution", record.getMessage())
+        self.assertIn("retrying in 1s", record.getMessage())
+
+    def test_other_discord_client_records_pass_through(self):
+        with self.assertLogs("discord.client", level="ERROR"):
+            try:
+                raise ValueError("bug")
+            except ValueError:
+                self.client_log.exception("Ignoring exception in on_message")
+
+    def back_lines(self, event):
+        """Two failed reconnects, then `event` fired twice: the outage closes once."""
+        client = discord_bot.UsageClient(cfg(), self.outage)
+        with self.assertLogs("clr.discord", level="INFO") as clr_logs:
+            self.reconnect()
+            self.reconnect()
+            asyncio.run(getattr(client, event)())
+            asyncio.run(getattr(client, event)())
+        return [r.getMessage() for r in clr_logs.records if "back after" in r.getMessage()]
+
+    def test_resumed_reports_the_outage_once(self):
+        back = self.back_lines("on_resumed")
+        self.assertEqual(len(back), 1, back)
+        self.assertIn("2 failed attempt(s)", back[0])
+
+    def test_ready_reports_the_outage_once(self):
+        """A session Discord will not resume ends in READY instead."""
+        back = self.back_lines("on_ready")
+        self.assertEqual(len(back), 1, back)
+        self.assertIn("2 failed attempt(s)", back[0])
 
 
 if __name__ == "__main__":

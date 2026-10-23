@@ -26,6 +26,7 @@ from .auth import (
     start_login,
 )
 from .config import (
+    APP_DIR,
     DEFAULT_CONFIG_PATH,
     TOKEN_PATH,
     ConfigError,
@@ -101,12 +102,12 @@ def _mask(secret: str) -> str:
 
 def _ask_secret(prompt: str, env_var: str) -> str:
     """Read a bot token without echoing it, or defer to the environment."""
-    if os.environ.get(env_var):
+    if os.environ.get(env_var, "").strip():  # whitespace only counts as unset
         if _ask_yes_no(f"  {env_var} is set in the environment - use it?", True):
             return ""
         # The loader lets the variable win over the file, and the service
         # install copies it. Drop it here so the rest of setup, and the
-        # service it installs, use the token typed below (F-061).
+        # service it installs, use the token typed below.
         del os.environ[env_var]
         print(
             f"  Ignoring {env_var} for the rest of setup. It still overrides\n"
@@ -319,6 +320,8 @@ def _handoff(python: Path, args) -> int:
     was installed with, and that must be the one holding the dependencies.
     """
     cmd = [str(python), str(PROJECT_DIR / "run.py")]
+    if args.verbose:
+        cmd.append("-v")
     if args.config:
         cmd += ["-c", str(args.config)]
     cmd.append("setup")
@@ -508,10 +511,16 @@ def _step_write(path: Path, answers: dict) -> bool:
             print("Left the existing config alone. Nothing was written.")
             return False
         backup = path.with_name(path.name + ".bak")
-        write_private(backup, path.read_bytes())  # it holds the old tokens
+        try:
+            write_private(backup, path.read_bytes())  # it holds the old tokens
+        except OSError as e:
+            raise ConfigError(f"cannot back up {path} to {backup}: {e}; nothing was written") from e
         print(f"Backed up to {backup}")
 
-    write_config(path, text)
+    try:
+        write_config(path, text)
+    except OSError as e:  # written atomically, so any existing file is unchanged
+        raise ConfigError(f"cannot write {path}: {e}") from e
     print(f"Wrote {path}")
     return True
 
@@ -579,7 +588,7 @@ def _step_service(path: Path) -> bool:
         return False
 
     # Under sudo, this wizard's login and config belong to root, but the unit
-    # would run as SUDO_USER, who cannot read them (F-045).
+    # would run as SUDO_USER, who cannot read them.
     geteuid = getattr(os, "geteuid", None)
     sudo_user = os.environ.get("SUDO_USER")
     if geteuid is not None and geteuid() == 0 and sudo_user:
@@ -600,7 +609,9 @@ def _step_service(path: Path) -> bool:
             # Installing into /etc/systemd/system needs root, so re-run just the
             # install under sudo rather than asking for the whole wizard to be.
             if _sudo_install(path) != 0:
-                print("\nThe config is still valid; `python run.py run` works.",
+                # The child ran `service install`'s checks, so its error may be
+                # one `run` hits too (a missing library); never claim run works.
+                print("\nThe service was not installed; see the error above.",
                       file=sys.stderr)
                 return False
         else:
@@ -634,13 +645,20 @@ def cmd_setup(args) -> int:
     try:
         return _run_wizard(args, path)
     except NoInput:
-        # The prompts do not know which file -c named; point at that one (F-065).
+        # The prompts do not know which file -c named; point at that one.
         raise SetupAborted(_no_tty_message(path)) from None
 
 
 def _run_wizard(args, path: Path) -> int:
     print("ClaudeLimitReader setup")
-    print(f"App directory: {ensure_app_dir()}")
+    try:
+        app_dir = ensure_app_dir()
+    except OSError as e:
+        raise ConfigError(
+            f"cannot create the app directory {APP_DIR}: {e}; set CLR_HOME to a "
+            "folder you can write"
+        ) from e
+    print(f"App directory: {app_dir}")
     print("Ctrl-C stops at any point; the config is written only at the end.")
 
     handoff = _step_env(args)

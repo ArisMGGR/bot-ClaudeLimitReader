@@ -93,11 +93,105 @@ class DailyFileHandler(logging.FileHandler):
         super().emit(record)
 
 
+def describe_error(exc: BaseException) -> str:
+    """One line for a connection failure, instead of a traceback.
+
+    aiohttp and httpx already name the host and the cause in the message
+    ("Cannot connect to host gateway…:443 ssl:default [Temporary failure in
+    name resolution]"); the frames through library internals add nothing. A
+    message-less exception (asyncio.TimeoutError) borrows its cause's text.
+    """
+    name = type(exc).__name__
+    seen = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur).strip()
+        if text:
+            return f"{name}: {text}" if cur is exc else f"{name}: {type(cur).__name__}: {text}"
+        cur = cur.__cause__ or cur.__context__
+    return name
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+class Outage:
+    """Folds a run of connection failures into short, countable log lines.
+
+    Every failed attempt gets one WARNING line with its cause. An outage still
+    going after ``escalate_after`` seconds gets one ERROR, and ``restored()``
+    closes it with an INFO line giving its length and attempt count. Without a
+    ``restored()`` signal, ``quiet_gap`` (seconds without a failure) ends it.
+    """
+
+    ESCALATE_AFTER = 15 * 60
+
+    def __init__(
+        self,
+        log: logging.Logger,
+        what: str,
+        escalate_after: float = ESCALATE_AFTER,
+        quiet_gap: float | None = None,
+    ) -> None:
+        self.log = log
+        self.what = what
+        self.escalate_after = escalate_after
+        self.quiet_gap = quiet_gap
+        self.down_since: float | None = None
+        self.last_failure = 0.0
+        self.failures = 0
+        self.escalated = False
+        self.cause = ""
+
+    def failed(self, exc: BaseException, retry_in: float | None = None, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        if self.down_since is not None and self.quiet_gap is not None \
+                and now - self.last_failure > self.quiet_gap:
+            self.down_since = None  # recovered unannounced in between
+        if self.down_since is None:
+            self.down_since, self.failures, self.escalated = now, 0, False
+        self.failures += 1
+        self.last_failure = now
+        self.cause = describe_error(exc)
+        down = _duration(now - self.down_since)
+        retry = f"; retrying in {retry_in:.0f}s" if retry_in is not None else ""
+        if not self.escalated and now - self.down_since >= self.escalate_after:
+            self.escalated = True
+            self.log.error(
+                "%s still down after %s (%d failed attempts): %s%s",
+                self.what, down, self.failures, self.cause, retry,
+            )
+        else:
+            self.log.warning(
+                "%s unreachable (attempt %d, down %s): %s%s",
+                self.what, self.failures, down, self.cause, retry,
+            )
+
+    def restored(self, now: float | None = None) -> None:
+        if self.down_since is None:
+            return
+        now = time.time() if now is None else now
+        self.log.info(
+            "%s back after %s (%d failed attempt(s); last error: %s)",
+            self.what, _duration(now - self.down_since), self.failures, self.cause,
+        )
+        self.down_since = None
+
+
 class ErrorWatch(logging.Handler):
-    """Remembers when the last ERROR (or worse) record went through."""
+    """Remembers when the last WARNING (or worse) record went through."""
 
     def __init__(self) -> None:
-        super().__init__(level=logging.ERROR)
+        super().__init__(level=logging.WARNING)
         self.last_error: float | None = None
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -108,11 +202,12 @@ class ErrorWatch(logging.Handler):
 
 
 async def heartbeat(interval: float = 30 * 60) -> None:
-    """Log an "all good" line every ``interval`` seconds without errors.
+    """Log an "all good" line every ``interval`` seconds without problems.
 
     Keeps the daily log from going silent for hours on a healthy bot, so a
-    quiet file still proves the process was alive. A window that saw an error
-    gets no heartbeat: the error itself is already in the log.
+    quiet file still proves the process was alive. A window that saw a warning
+    or error (a dropped connection, say) gets no heartbeat: that line is
+    already in the log.
     """
     log = logging.getLogger("clr")
     watch = ErrorWatch()
@@ -124,7 +219,7 @@ async def heartbeat(interval: float = 30 * 60) -> None:
             window_start = time.time()
             await asyncio.sleep(interval)
             if watch.quiet_since(window_start):
-                log.info("All good — no errors in the last %d minutes.", minutes)
+                log.info("All good — no warnings or errors in the last %d minutes.", minutes)
     finally:
         root.removeHandler(watch)
 

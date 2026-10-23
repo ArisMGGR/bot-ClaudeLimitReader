@@ -104,7 +104,7 @@ def _parse_ts(value) -> dt.datetime | None:
         parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        # A time at the edge of the range can overflow converting to UTC (F-064).
+        # A time at the edge of the range can overflow converting to UTC.
         return parsed.astimezone(dt.timezone.utc)
     except (ValueError, OverflowError):
         return None
@@ -210,7 +210,7 @@ def _get(url: str, token: str, timeout: int = 30) -> tuple[int, dict]:
         try:
             raw = e.read()
         except (OSError, http.client.HTTPException) as read_error:
-            # The status still counts, so a 401 still triggers the refresh (F-060).
+            # The status still counts, so a 401 still triggers the refresh.
             return e.code, {"error": f"HTTP {e.code}; the body could not be read: {read_error}"}
         body = _decode(raw)
         return e.code, body if body is not None else {"error": raw.decode(errors="replace")[:500]}

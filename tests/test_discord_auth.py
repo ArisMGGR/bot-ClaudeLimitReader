@@ -409,6 +409,20 @@ class StartupRetryTest(unittest.IsolatedAsyncioTestCase):
             await discord_bot.run(cfg())
         self.assertEqual(log, ["new", "close", "new", "connect", "close"])
 
+    async def test_a_server_disconnect_is_retried(self):
+        """aiohttp's ServerDisconnectedError is a ClientError but not an OSError."""
+        import aiohttp
+
+        from clr import bots
+
+        log = []
+        fake = self.fake_client([aiohttp.ServerDisconnectedError(), None], log)
+        with mock.patch.object(discord_bot, "UsageClient", fake), \
+             mock.patch.object(bots, "FIRST_RETRY_DELAY", 0), \
+             self.assertLogs("clr", level="WARNING"):
+            await discord_bot.run(cfg())
+        self.assertEqual(log, ["new", "close", "new", "connect", "close"])
+
     async def test_a_rejected_token_is_not_retried(self):
         """It ends the run as a ConfigError (an Error line), not a traceback."""
         import discord

@@ -194,6 +194,20 @@ class StatusTest(unittest.TestCase):
         self.assertIn(str(other), line)
         self.assertNotIn("[missing]", line)
 
+    def test_token_lifetime_reads_like_the_discord_status(self):
+        """Hours and minutes, as /status shows it, not a raw timedelta."""
+        import time
+
+        tokens = types.SimpleNamespace(
+            expires_at=time.time() + 7 * 3600 + 1234.5, expired=False, account_email="", scope=""
+        )
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_tokens", return_value=tokens), \
+             contextlib.redirect_stdout(out):
+            cli.cmd_status(types.SimpleNamespace(config=None))
+        line = next(ln for ln in out.getvalue().splitlines() if ln.startswith("Access tok"))
+        self.assertIn("valid for 7h 20m", line)
+
 
 class ConfigUseTest(unittest.TestCase):
     def config(self, text):
@@ -504,6 +518,17 @@ class TelegramLifecycleTest(unittest.TestCase):
             asyncio.run(run())
         self.assertLess(app.calls.index("initialize"), app.calls.index("post_init"))
         self.assertLess(app.calls.index("post_init"), app.calls.index("start"))
+
+    def test_the_real_application_registers_usage(self):
+        """build_application wires _post_init, which sets the /usage command."""
+        cfg = Config(telegram=TelegramConfig(enabled=True, token="123456:abc",
+                                             allowed_user_ids=[1]))
+        app = telegram_bot.build_application(cfg)
+        self.assertIs(app.post_init, telegram_bot._post_init)
+        bot = mock.AsyncMock()
+        asyncio.run(app.post_init(types.SimpleNamespace(bot=bot)))
+        commands = bot.set_my_commands.await_args.args[0]
+        self.assertEqual([c.command for c in commands], ["usage"])
 
     def test_network_failure_at_initialize_is_retried(self):
         """No network at logon: shut the attempt down and try again."""

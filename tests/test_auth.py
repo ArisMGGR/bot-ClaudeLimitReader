@@ -124,6 +124,25 @@ class RefreshSerializationTest(StoreTestCase):
         self.assertEqual(tokens.access_token, "new")
 
 
+class FinishLoginTest(unittest.TestCase):
+    def test_a_mismatched_state_is_refused_before_the_exchange(self):
+        """A code from another login attempt never reaches the token endpoint."""
+        pending = auth.start_login()
+        with mock.patch.object(auth, "_post") as post:
+            with self.assertRaises(AuthError) as ctx:
+                auth.finish_login(pending, "the-code#not-this-state")
+        post.assert_not_called()
+        self.assertIn("state", str(ctx.exception))
+
+    def test_the_matching_state_is_exchanged(self):
+        pending = auth.start_login()
+        reply = (200, {"access_token": "a", "refresh_token": "r", "expires_in": 3600})
+        with mock.patch.object(auth, "_post", return_value=reply) as post:
+            tokens = auth.finish_login(pending, f"the-code#{pending.state}")
+        self.assertEqual(post.call_args.args[1]["code"], "the-code")
+        self.assertEqual(tokens.access_token, "a")
+
+
 class NetworkErrorTest(unittest.TestCase):
     """Network failures surface as the domain errors callers handle."""
 
@@ -192,6 +211,20 @@ class NetworkErrorTest(unittest.TestCase):
                             status, body = call()
                         self.assertEqual(status, code)
                         self.assertIn("could not be read", str(body))
+
+    def test_a_401_refreshes_once_and_retries(self):
+        """fetch_usage itself: a rejected token is refreshed, then the request repeated."""
+        replies = [(401, {"error": "HTTP 401; the body could not be read: x"}),
+                   (200, {"limits": []})]
+        with mock.patch.object(usage, "get_access_token", return_value="rejected"), \
+             mock.patch.object(usage, "force_refresh",
+                               return_value=Tokens("fresh", "r", time.time() + 3600)) as refresh, \
+             mock.patch.object(usage, "_get", side_effect=replies) as get, \
+             mock.patch.object(usage, "load_tokens", return_value=None):
+            report = usage.fetch_usage()
+        refresh.assert_called_once_with("rejected")
+        self.assertEqual([c.args[1] for c in get.call_args_list], ["rejected", "fresh"])
+        self.assertEqual(report.windows, [])
 
 
 if __name__ == "__main__":

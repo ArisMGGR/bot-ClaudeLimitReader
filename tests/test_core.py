@@ -64,6 +64,14 @@ class TestParse(unittest.TestCase):
         self.assertEqual(report.primary_weekly.key, "weekly_all")
         self.assertEqual(session_of(report).percent, 34)
 
+    def test_pace_follows_the_all_models_cap_not_the_fullest_weekly(self):
+        """On Max, a model window can be fuller than the all-models one."""
+        payload = {"limits": [
+            {"kind": "weekly_opus", "group": "weekly", "percent": 80},
+            {"kind": "weekly_all", "group": "weekly", "percent": 30},
+        ]}
+        self.assertEqual(parse_usage(payload).primary_weekly.key, "weekly_all")
+
     def test_null_windows_are_skipped(self):
         report = parse_usage(LIVE_PAYLOAD)
         self.assertNotIn("seven_day_opus", [w.key for w in report.windows])

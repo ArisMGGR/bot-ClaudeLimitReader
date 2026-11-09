@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import logging
 
+import aiohttp
 import discord
 from discord import app_commands
 
@@ -404,11 +405,14 @@ async def run(cfg: Config) -> None:
             raise
         return client
 
-    # OSError covers aiohttp's connection errors. connect() then handles its
-    # own reconnects; a bad token (LoginFailure) is not retried.
+    # OSError covers aiohttp's connection errors; aiohttp.ClientError also
+    # covers those that are not OSErrors (a server disconnect mid-request), as
+    # in connect()'s own reconnect loop. connect() then handles its own
+    # reconnects; a bad token (LoginFailure) is not retried.
     try:
         client = await retry_startup(
-            "discord", login, (OSError, discord.DiscordServerError, discord.GatewayNotFound)
+            "discord", login,
+            (OSError, aiohttp.ClientError, discord.DiscordServerError, discord.GatewayNotFound),
         )
     except discord.LoginFailure:
         # An "Error:" line like Telegram's rejected token, not a traceback.

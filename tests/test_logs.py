@@ -132,6 +132,9 @@ class SudoOwnershipTest(unittest.TestCase):
         env = {"SUDO_UID": "", "SUDO_GID": ""}
         self.assertEqual(self.build(directory, 1000, env), [])
         self.assertEqual(self.build(directory / "again", 0, env), [])
+        # SUDO_UID is inherited by a non-root child (`sudo -u someone`); only root chowns.
+        sudo_env = {"SUDO_UID": "1000", "SUDO_GID": "1001"}
+        self.assertEqual(self.build(directory / "child", 1000, sudo_env), [])
 
 
 class OutageTest(unittest.TestCase):

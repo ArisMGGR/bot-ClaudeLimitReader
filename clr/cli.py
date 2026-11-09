@@ -22,6 +22,7 @@ from .config import (
     load_config,
 )
 from .logs import Outage, build_handler as build_log_handler, heartbeat
+from .pace import humanize
 from .render import render_plain
 from .service import ServiceError, record_running_instance
 from .setup import cmd_setup, interactive_login
@@ -130,7 +131,7 @@ def cmd_status(args) -> int:
 
     expires = dt.datetime.fromtimestamp(tokens.expires_at, dt.timezone.utc)
     remaining = expires - dt.datetime.now(dt.timezone.utc)
-    state = "expired" if tokens.expired else f"valid for {remaining}"
+    state = "expired" if tokens.expired else f"valid for {humanize(remaining)}"
 
     print(f"Token file : {TOKEN_PATH}")
     if tokens.account_email:

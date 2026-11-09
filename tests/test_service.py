@@ -577,6 +577,23 @@ class WindowsStatePathTest(unittest.TestCase):
         self.assertIn(str(legacy), note)
 
 
+class WindowsUninstallTest(unittest.TestCase):
+    def test_uninstall_stops_the_running_bot(self):
+        """Removing the launcher alone would leave the bot running until logoff."""
+        root = Path(tempfile.mkdtemp())
+        launcher = root / "state" / "bot.cmd"
+        launcher.parent.mkdir()
+        launcher.write_text("", encoding="utf-8")
+        with mock.patch.multiple(service, TASK_LAUNCHER=launcher,
+                                 LEGACY_TASK_LAUNCHER=root / "app" / "bot.cmd",
+                                 STARTUP_SCRIPT=root / "Startup" / "bot.cmd"), \
+             mock.patch.object(service, "_task_exists", return_value=False), \
+             mock.patch.object(service, "_stop_detached", return_value="stopped") as stop:
+            note = service._uninstall_windows()
+        stop.assert_called_once()
+        self.assertIn("Stopped the running instance", note)
+
+
 class WindowsStatusTest(unittest.TestCase):
     """Both install modes say whether the bot runs and where it logs."""
 
